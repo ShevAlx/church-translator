@@ -8,3 +8,4 @@ logs/
 dist/
 build/
 .DS_Store
+start_on_new_machine.md
