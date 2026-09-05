@@ -1,0 +1,42 @@
+# Copy to config.yaml and adjust. Run `church-translator list-devices` first
+# to see real device names/channel counts on this machine.
+#
+# This example targets whatever 2-in/2-out interface is plugged in right now
+# (on the dev machine that was the Dell USB soundbar) so `mode: mock` is
+# runnable today, on headphones, with no church hardware attached yet:
+# language "ru" comes out the left channel, "en" out the right, each as a
+# distinct beep pitch — that's the whole smoke test for Milestone 1.
+#
+# At the church, swap `device` for the real audio interface's name (see
+# report §09) and `input_channel` for whichever channel carries the mixer's
+# AUX/direct-out feed.
+
+audio:
+  input_device: "DELL"   # substring match against `list-devices` output; null = system default
+  output_device: "DELL"  # set separately — some USB interfaces split in/out into two devices
+  samplerate: 48000
+  blocksize: 512         # frames/callback, ~10.7ms at 48kHz
+  input_channel: 0
+
+source_languages:
+  - en   # what STT should expect to hear — separate from `languages` below (the output/target set)
+
+languages:
+  - name: russian
+    code: ru
+    output_channel: 0
+    voice_id: ""          # set once you have a real, locked Cartesia/ElevenLabs voice id (Milestone 2)
+  - name: english
+    code: en
+    output_channel: 1
+    voice_id: ""
+
+pipeline:
+  mode: mock              # passthrough | mock | real
+  stt_provider: assemblyai
+  mt_provider: claude
+  tts_provider: cartesia
+
+logging:
+  usage_log_path: "./logs/usage.csv"
+  recordings_dir: "./logs/recordings"   # один непрерывный wav на язык за сессию, в подпапке по дате

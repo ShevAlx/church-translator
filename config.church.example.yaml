@@ -1,0 +1,58 @@
+# Конфигурация под ваше реальное железо и стартовый сценарий:
+#   Behringer X32 (copy of Main L/R) --USB--> Focusrite Scarlett 2i2 --jack-->
+#   Left output -> передатчик 1 (ru) · Right output -> передатчик 2 (uk)
+#
+# Источник — английский. Цели — русский и украинский. Это не одно и то же:
+# source_languages ниже говорит STT, что распознавать (только то, что
+# реально звучит в микрофоне); languages ниже — это то, что MT/TTS
+# производят на выходе. Раньше в коде эти два списка были одним и тем же —
+# для en->ru/uk так не работает: AssemblyAI live-тестом 19.08.2026 отверг
+# "uk" как источник (украинского нет в их списке распознаваемых языков),
+# хотя украинский на выходе (Cartesia TTS) работает нормально.
+#
+# Копируйте в config.yaml, когда интерфейс физически подключён к этому Mac.
+# Перед первым запуском обязательно сверьтесь с `list-devices`.
+
+audio:
+  input_device: "Scarlett 2i2"
+  output_device: "Scarlett 2i2"
+  samplerate: 48000
+  blocksize: 512
+  input_channel: 0   # канал L со входа "copy of Main L/R" с X32
+
+source_languages:
+  - en   # только то, что реально ожидается от спикера — не ru/uk
+
+languages:
+  - name: russian
+    code: ru
+    output_channel: 0   # -> Left output -> передатчик 1
+    voice_id: "1e4176b1-3db9-44d6-a601-4fe68b041942"   # Cartesia: Sergei (native ru), live-проверен
+  - name: ukrainian
+    code: uk
+    output_channel: 1   # -> Right output -> передатчик 2
+    voice_id: "05ffab9c-d380-4909-8375-cd12f59238c3"   # Cartesia: Oleh (native uk) — пока единственный uk-голос в каталоге
+
+pipeline:
+  mode: mock   # переключить на real, когда будете тестировать живым звуком
+  stt_provider: assemblyai
+  mt_provider: claude
+  tts_provider: cartesia
+
+logging:
+  usage_log_path: "./logs/usage.csv"
+  recordings_dir: "./logs/recordings"   # один непрерывный wav на язык за сессию, в подпапке по дате
+
+# --- Ограничения именно этой связки ---
+#
+# 1. Потолок — 2 языка (2 выхода у Scarlett 2i2). Третий язык — либо
+#    Aggregate Device из двух интерфейсов, либо карта побольше.
+#
+# 2. Вход — "copy of Main L/R" с X32, то есть весь микс, а не изолированный
+#    микрофон спикера. Для точности STT в перспективе лучше развести
+#    отдельную AUX-шину только с речью.
+#
+# 3. Голос на украинский канал — только один вариант в каталоге Cartesia
+#    (Oleh, мужской). Если нужен выбор голоса/пола — стоит проверить
+#    каталог заново позже или рассмотреть ElevenLabs как альтернативу для
+#    именно этого языка.
