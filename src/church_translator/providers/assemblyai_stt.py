@@ -25,7 +25,7 @@ made the handshake fail outright. `StreamingClient.connect()` does NOT raise
 on that — read its docstring: an HTTP-level rejection (bad key, quota) or an
 exhausted retry chain is *dispatched to the Error handler and swallowed*,
 and connect() returns normally. So the old code built a dead client, the
-menu-bar app lit up "● Работает", and the booth heard silence for a whole
+menu-bar app lit up "● Работает" ("Running"), and the booth heard silence for a whole
 service with nothing on screen saying why. Now the constructor waits for the
 Begin frame that proves a live session and raises if it never arrives, and a
 mid-session drop is recorded in `fatal_error` so the app can surface it.
@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 
 import numpy as np
 
@@ -50,6 +51,13 @@ class AssemblyAISTT(STTProvider):
         language_codes: list[str] | None = None,
         send_chunk_ms: float = 100.0,  # inside AssemblyAI's required 50-1000ms window, with margin
         connect_timeout_s: float = 15.0,
+        end_of_turn_confidence_threshold: float | None = None,
+        min_turn_silence_ms: int | None = None,
+        max_turn_silence_ms: int | None = None,
+        partial_emit: bool = True,
+        partial_min_words: int = 8,
+        partial_max_words: int = 25,
+        partial_gap_ms: int = 250,
     ):
         import assemblyai.streaming.v3 as s3
 
@@ -62,6 +70,12 @@ class AssemblyAISTT(STTProvider):
         self._send_buffer = np.zeros(0, dtype=np.float32)
         self._handshake = threading.Event()
         self._closing = False
+        self._partial_emit = partial_emit
+        self._partial_min_words = partial_min_words
+        self._partial_max_words = partial_max_words
+        self._partial_gap_ms = partial_gap_ms
+        self._turn_order: int | None = None
+        self._emitted_words = 0
 
         self._client = s3.StreamingClient(
             s3.StreamingClientOptions(api_key=api_key or os.environ["ASSEMBLYAI_API_KEY"])
@@ -78,6 +92,18 @@ class AssemblyAISTT(STTProvider):
             encoding=s3.Encoding.pcm_s16le,
             format_turns=True,
         )
+        # Endpointing. Left unset, the SDK uses phone-call defaults that wait for
+        # the speaker to hand the floor over — a preacher never does, so turns ran
+        # to 921 characters (~60s) on the 2026-09-06 service and nothing reached
+        # translation until then. See config.STTConfig for the reasoning.
+        if end_of_turn_confidence_threshold is not None:
+            params["end_of_turn_confidence_threshold"] = end_of_turn_confidence_threshold
+        if min_turn_silence_ms is not None:
+            # `min_turn_silence`, not the older `min_end_of_turn_silence_when_confident` —
+            # the SDK marks that one deprecated and warns on every start.
+            params["min_turn_silence"] = min_turn_silence_ms
+        if max_turn_silence_ms is not None:
+            params["max_turn_silence"] = max_turn_silence_ms
         if language_codes:
             params["language_codes"] = language_codes  # pin a candidate set
         else:
@@ -103,13 +129,67 @@ class AssemblyAISTT(STTProvider):
         self._handshake.set()
 
     def _on_turn(self, client, turn) -> None:
-        if not turn.end_of_turn:
-            return  # partials aren't pushed downstream — MT/TTS want finished utterances
+        """Emit clauses as they are finalized, not only when the turn closes.
+
+        Waiting for `end_of_turn` puts a hard floor under the delay equal to how
+        long the speaker talks without pausing — you cannot translate a sentence
+        before it has been said. Measured 2026-09-06: a 457-character turn, ~30s
+        of unbroken speech, and the booth's delay tracked it exactly (10s, then
+        20s, then 30s) while MT and TTS were only costing 0.18s.
+
+        AssemblyAI marks each word `word_is_final` once it stops revising it and
+        gives millisecond timings, so a finished clause can go to translation
+        while the speaker is still talking — which is what a human interpreter
+        does. Cuts are placed at a real pause between words wherever one exists,
+        so the fragment handed to MT is a clause and not an arbitrary slice.
+        """
+        if turn.turn_order != self._turn_order:
+            self._turn_order = turn.turn_order
+            self._emitted_words = 0
+
+        if turn.end_of_turn:
+            # The formatted transcript is the good one (punctuation, casing), so
+            # the tail is taken from it — minus whatever already went out early.
+            tokens = turn.transcript.split()
+            tail = " ".join(tokens[self._emitted_words :])
+            self._emitted_words = 0
+            self._turn_order = None
+            if tail.strip():
+                self._emit(tail, turn)
+            return
+
+        if not self._partial_emit:
+            return
+
+        final_words = []
+        for w in turn.words:
+            if not w.word_is_final:
+                break  # only the leading run of settled words is safe to send
+            final_words.append(w)
+        pending = final_words[self._emitted_words :]
+        if len(pending) < self._partial_min_words:
+            return
+
+        # Prefer the last real pause; a clause boundary beats a word count.
+        cut = 0
+        for i in range(len(pending) - 1):
+            if pending[i + 1].start - pending[i].end >= self._partial_gap_ms:
+                cut = i + 1
+        if cut < self._partial_min_words:
+            if len(pending) < self._partial_max_words:
+                return  # keep waiting for a pause
+            cut = self._partial_max_words  # speaker is not pausing; cut anyway
+
+        self._emit(" ".join(w.text for w in pending[:cut]), turn)
+        self._emitted_words += cut
+
+    def _emit(self, text: str, turn) -> None:
         self._events.put(
             TranscriptEvent(
-                text=turn.transcript,
+                text=text,
                 is_final=True,
                 language_code=turn.language_code or "auto",
+                received_at=time.monotonic(),
             )
         )
 

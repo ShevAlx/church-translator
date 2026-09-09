@@ -14,6 +14,7 @@ pipeline.mode="passthrough" instead — see pipeline.py.
 
 from __future__ import annotations
 
+import time
 import zlib
 
 import numpy as np
@@ -31,7 +32,8 @@ class MockSTT(STTProvider):
         if self._samples_seen < self._threshold:
             return None
         self._samples_seen = 0
-        return TranscriptEvent(text="mock transcript", is_final=True, language_code="auto")
+        return TranscriptEvent(text="mock transcript", is_final=True, language_code="auto",
+                               received_at=time.monotonic())
 
     def close(self) -> None:
         pass

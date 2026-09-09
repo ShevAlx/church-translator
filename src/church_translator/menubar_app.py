@@ -1,5 +1,5 @@
 """Menu-bar app for the booth operator — report §09's third requirement
-("маршрутизация каналов без правки кода") in its simplest possible form.
+("channel routing without editing code") in its simplest possible form.
 
 Everything here calls straight into the same AudioRouter/Pipeline classes
 `cli.py run` uses — no subprocess, no `uv run` wrapper, so Start/Stop are
@@ -46,6 +46,8 @@ def _save_config(config: AppConfig, path: Path = CONFIG_PATH) -> None:
             "blocksize": config.audio.blocksize,
             "input_channel": config.audio.input_channel,
             "max_backlog_s": config.audio.max_backlog_s,
+            "catchup_start_s": config.audio.catchup_start_s,
+            "max_playback_rate": config.audio.max_playback_rate,
         },
         "source_languages": config.source_languages,
         "languages": [
@@ -58,6 +60,21 @@ def _save_config(config: AppConfig, path: Path = CONFIG_PATH) -> None:
             "mt_provider": config.pipeline.mt_provider,
             "tts_provider": config.pipeline.tts_provider,
         },
+        # Round-tripped, not defaulted: this function rewrites the whole file, so
+        # anything missing here is silently erased from the operator's config the
+        # first time they touch a menu.
+        "stt": {
+            "end_of_turn_confidence_threshold": config.stt.end_of_turn_confidence_threshold,
+            "min_turn_silence_ms": (
+                config.stt.min_turn_silence_ms
+            ),
+            "max_turn_silence_ms": config.stt.max_turn_silence_ms,
+            "partial_emit": config.stt.partial_emit,
+            "partial_min_words": config.stt.partial_min_words,
+            "partial_max_words": config.stt.partial_max_words,
+            "partial_gap_ms": config.stt.partial_gap_ms,
+        },
+        "tts": {"speed": config.tts.speed},
         "logging": {
             "usage_log_path": config.logging.usage_log_path,
             "debug_audio_dir": config.logging.debug_audio_dir,
@@ -237,6 +254,8 @@ class ChurchTranslatorApp(rumps.App):
                 input_channel=self.config.audio.input_channel,
                 output_channels=[lang.output_channel for lang in self.config.languages],
                 max_backlog_s=self.config.audio.max_backlog_s,
+                catchup_start_s=self.config.audio.catchup_start_s,
+                max_playback_rate=self.config.audio.max_playback_rate,
             )
             usage_logger = UsageLogger(self.config.logging.usage_log_path)
             session_id = usage_logger.new_session_id()
@@ -245,6 +264,9 @@ class ChurchTranslatorApp(rumps.App):
                 recordings_dir = Path(self.config.logging.recordings_dir) / date_folder(session_id)
                 for lang in self.config.languages:
                     self.router.start_recording(lang.output_channel, recordings_dir / f"{session_id}-{lang.code}.wav")
+                # Same timeline as the outputs — this is what makes the delay
+                # measurable after the fact, and makes the service replayable.
+                self.router.start_input_recording(recordings_dir / f"{session_id}-source.wav")
 
             if self.config.pipeline.mode == "mock":
                 stt = MockSTT(samplerate=self.config.audio.samplerate)
@@ -258,9 +280,24 @@ class ChurchTranslatorApp(rumps.App):
                 from .providers.cartesia_tts import CartesiaTTS
                 from .providers.claude_mt import ClaudeMT
 
-                stt = AssemblyAISTT(samplerate=self.config.audio.samplerate, language_codes=self.config.source_languages or None)
+                stt = AssemblyAISTT(
+                    samplerate=self.config.audio.samplerate,
+                    language_codes=self.config.source_languages or None,
+                    end_of_turn_confidence_threshold=self.config.stt.end_of_turn_confidence_threshold,
+                    min_turn_silence_ms=(
+                        self.config.stt.min_turn_silence_ms
+                    ),
+                    max_turn_silence_ms=self.config.stt.max_turn_silence_ms,
+                    partial_emit=self.config.stt.partial_emit,
+                    partial_min_words=self.config.stt.partial_min_words,
+                    partial_max_words=self.config.stt.partial_max_words,
+                    partial_gap_ms=self.config.stt.partial_gap_ms,
+                )
                 mt_by_lang = {lang.code: ClaudeMT() for lang in self.config.languages}
-                tts_by_lang = {lang.code: CartesiaTTS(samplerate=self.config.audio.samplerate) for lang in self.config.languages}
+                tts_by_lang = {
+                    lang.code: CartesiaTTS(samplerate=self.config.audio.samplerate, speed=self.config.tts.speed)
+                    for lang in self.config.languages
+                }
 
             self.pipeline = Pipeline(
                 self.config, self.router, usage_logger,
@@ -285,16 +322,24 @@ class ChurchTranslatorApp(rumps.App):
             self.pipeline.stop()
         if self.router:
             underruns = self.router.underrun_report()
+            dropped = self.router.dropped_report()
             self.router.stop()
         else:
-            underruns = {}
+            underruns, dropped = {}, {}
         self.pipeline = None
         self.router = None
         self.session_start = None
         self.toggle_item.title = "▶️ Запустить перевод"
         self.title = "🎙️"
         self.status_item.title = "○ Остановлено"
-        if any(underruns.values()):
+        if any(dropped.values()):
+            # Shown because it is the one number that says whether listeners
+            # actually heard the service or a skipped version of it.
+            rumps.notification(
+                "church-translator", "Остановлено",
+                f"Пропущено реплик (отставание): {dropped}. Много — увеличьте max_backlog_s.",
+            )
+        elif any(underruns.values()):
             rumps.notification("church-translator", "Остановлено", f"Underruns по каналам: {underruns}")
 
     def _tick(self, _sender) -> None:

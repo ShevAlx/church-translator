@@ -39,4 +39,4 @@ pipeline:
 
 logging:
   usage_log_path: "./logs/usage.csv"
-  recordings_dir: "./logs/recordings"   # один непрерывный wav на язык за сессию, в подпапке по дате
+  recordings_dir: "./logs/recordings"   # one continuous wav per language per session, in a date-named subfolder

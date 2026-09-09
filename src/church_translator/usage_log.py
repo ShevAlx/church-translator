@@ -1,4 +1,4 @@
-"""Usage/cost logging — report §06 "Как отслеживать расходы".
+"""Usage/cost logging — report §06 "How to track spend".
 
 Every STT/MT/TTS call already tells you its own duration or character count;
 this just writes that down next to a timestamp and a session id, in a plain
@@ -55,5 +55,9 @@ def date_folder(session_id: str) -> str:
     """"svc-20260820-013845" -> "2026-08-20" — one folder per day of service,
     shared by anything that names its files after a session_id (recordings,
     debug audio) so they land in the same place without a second clock read."""
-    date_part = session_id.split("-")[1]
-    return f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
+    for part in session_id.split("-"):
+        if len(part) == 8 and part.isdigit():
+            return f"{part[:4]}-{part[4:6]}-{part[6:8]}"
+    # No date in the id (a hand-made session name in a test) — one folder for
+    # those beats scattering half-parsed garbage directories through logs/.
+    return "undated"

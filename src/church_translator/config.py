@@ -25,9 +25,32 @@ class AudioConfig:
     blocksize: int = 512  # frames/callback; 512 @ 48kHz ~= 10.7ms
     input_channel: int = 0  # 0-indexed channel on the input side carrying the mixer feed
     # How far behind the speaker a listener is allowed to fall before whole
-    # utterances start getting skipped. See AudioRouter.push_output — without a
+    # sentences start getting skipped. See AudioRouter.push_output — without a
     # cap the lag grows for the entire service and never comes back.
-    max_backlog_s: float = 4.0
+    #
+    # This is the operator's main trade-off knob: lower = more current but more
+    # sentences skipped, higher = fewer skips but further behind. It was 4.0,
+    # chosen back when a drop also decapitated the sentence being played, so it
+    # had to be tight. Now that the playing sentence always finishes and only
+    # stale queued ones are skipped, a tight cap just throws away translation
+    # that would have been heard: on the 2026-09-06 service 55% of the
+    # synthesized Russian was dropped. 10s keeps the listener within one
+    # sentence of the speaker while skipping far less.
+    max_backlog_s: float = 10.0
+
+    # Catch-up playback. At 95% channel load (measured 2026-09-06: 98.4s of
+    # Russian for 104s of speech) there is almost no idle time, so any lag the
+    # channel picks up is permanent — skipping whole thoughts was the only way
+    # back, which is why the listener heard 25% of the service go missing and
+    # the delay still walked from 10s to 30s.
+    #
+    # Speeding playback up buys time without losing words, but it shifts pitch —
+    # on a voice cloned from the pastor that is immediately audible and was
+    # rejected (2026-09-06). OFF by default. The headroom is bought instead where
+    # it costs nothing: a shorter interpretation (claude_mt.py) and trimmed
+    # silence between clauses (pipeline.py). Left as an emergency knob only.
+    catchup_start_s: float = 2.0     # start compressing once this far behind
+    max_playback_rate: float = 1.0   # 1.0 = off
 
 
 @dataclass
@@ -36,6 +59,53 @@ class LanguageConfig:
     code: str
     output_channel: int
     voice_id: str = ""  # locked TTS voice id for this language (Milestone 2+)
+
+
+@dataclass
+class STTConfig:
+    """AssemblyAI turn-endpointing. These decide how long the booth waits before
+    a sentence even reaches translation, so they are the single biggest lever on
+    perceived delay.
+
+    The SDK's defaults are tuned for phone-call turn-taking, where the other
+    party stops talking and waits. A preacher does not: measured on the
+    2026-09-06 service, AssemblyAI held single turns of up to 921 characters —
+    about a minute of speech with nothing sent downstream. Lower thresholds cut
+    a turn at natural clause pauses instead, which is what live interpretation
+    actually wants.
+    """
+
+    # 0-1; lower = end the turn on weaker evidence the speaker is done.
+    end_of_turn_confidence_threshold: float = 0.4
+    # Silence (ms) that closes a turn once the model is confident it ended.
+    min_turn_silence_ms: int = 400
+    # Hard ceiling (ms) on silence before a turn is closed regardless.
+    max_turn_silence_ms: int = 1000
+
+    # Send finished clauses to translation while the speaker is still talking.
+    # Without this the delay can never be shorter than the speaker's longest
+    # unbroken sentence — a 457-character turn on 2026-09-06 meant ~30s of delay
+    # no matter how fast the rest of the pipeline was. Set False to go back to
+    # translating only whole turns (better context, much worse delay).
+    partial_emit: bool = True
+    partial_min_words: int = 8    # never cut a fragment shorter than this
+    partial_max_words: int = 25   # speaker never pauses? cut anyway at this many
+    partial_gap_ms: int = 250     # a gap this long between words counts as a pause
+
+
+@dataclass
+class TTSConfig:
+    """Cartesia synthesis settings.
+
+    `speed` is exposed because Russian and Ukrainian render longer than the
+    English they came from (107% channel load measured 2026-08-23), so shorter
+    output would directly buy back lag. Measured 2026-09-06 on the cloned voice
+    with sonic-latest, though, "fast" did NOT shorten anything — 9.1-9.8s vs
+    8.9-9.0s for "normal" across repeats, i.e. noise. Left configurable in case
+    a future model honours it; do not count on it as a latency fix.
+    """
+
+    speed: str = "normal"  # "slow" | "normal" | "fast"
 
 
 @dataclass
@@ -72,6 +142,8 @@ class AppConfig:
     source_languages: list[str] = field(default_factory=lambda: ["en"])
     languages: list[LanguageConfig] = field(default_factory=list)  # output/target languages
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    stt: STTConfig = field(default_factory=STTConfig)
+    tts: TTSConfig = field(default_factory=TTSConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     def validate(self) -> None:
@@ -84,6 +156,10 @@ class AppConfig:
             seen_channels.add(lang.output_channel)
         if self.pipeline.mode not in ("mock", "real"):
             raise ValueError(f"pipeline.mode must be 'mock' or 'real', got {self.pipeline.mode!r}")
+        if not 1.0 <= self.audio.max_playback_rate <= 1.5:
+            raise ValueError(f"audio.max_playback_rate must be 1.0-1.5, got {self.audio.max_playback_rate}")
+        if self.tts.speed not in ("slow", "normal", "fast"):
+            raise ValueError(f"tts.speed must be slow/normal/fast, got {self.tts.speed!r}")
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -93,11 +169,13 @@ def load_config(path: str | Path) -> AppConfig:
     source_languages = raw.get("source_languages", ["en"])
     languages = [LanguageConfig(**lang) for lang in raw.get("languages", [])]
     pipeline = PipelineConfig(**raw.get("pipeline", {}))
+    stt = STTConfig(**raw.get("stt", {}))
+    tts = TTSConfig(**raw.get("tts", {}))
     logging_cfg = LoggingConfig(**raw.get("logging", {}))
 
     cfg = AppConfig(
         audio=audio, source_languages=source_languages, languages=languages,
-        pipeline=pipeline, logging=logging_cfg,
+        pipeline=pipeline, stt=stt, tts=tts, logging=logging_cfg,
     )
     cfg.validate()
     return cfg

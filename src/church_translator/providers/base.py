@@ -21,6 +21,11 @@ class TranscriptEvent:
     text: str
     is_final: bool
     language_code: str  # what the STT engine detected this segment as (report §04.2 code-switching)
+    # time.monotonic() when the speaker finished saying this. The output buffer
+    # needs it to tell "the listener is genuinely behind" from "the pipeline
+    # delivered this early" — those look identical if you only measure how much
+    # audio is queued. See AudioRouter.push_output.
+    received_at: float = 0.0
 
 
 class STTProvider(ABC):

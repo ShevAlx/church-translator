@@ -71,9 +71,19 @@ def _build_real_pipeline(config, router, usage_logger, session_id) -> Pipeline:
     stt = AssemblyAISTT(
         samplerate=config.audio.samplerate,
         language_codes=config.source_languages or None,
+        end_of_turn_confidence_threshold=config.stt.end_of_turn_confidence_threshold,
+        min_turn_silence_ms=config.stt.min_turn_silence_ms,
+        max_turn_silence_ms=config.stt.max_turn_silence_ms,
+        partial_emit=config.stt.partial_emit,
+        partial_min_words=config.stt.partial_min_words,
+        partial_max_words=config.stt.partial_max_words,
+        partial_gap_ms=config.stt.partial_gap_ms,
     )
     mt_by_lang = {lang.code: ClaudeMT() for lang in config.languages}
-    tts_by_lang = {lang.code: CartesiaTTS(samplerate=config.audio.samplerate) for lang in config.languages}
+    tts_by_lang = {
+        lang.code: CartesiaTTS(samplerate=config.audio.samplerate, speed=config.tts.speed)
+        for lang in config.languages
+    }
     return Pipeline(
         config, router, usage_logger, stt=stt, mt_by_language=mt_by_lang, tts_by_language=tts_by_lang,
         debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id,
@@ -94,6 +104,8 @@ def _cmd_run(args: argparse.Namespace) -> None:
         input_channel=config.audio.input_channel,
         output_channels=[lang.output_channel for lang in config.languages],
         max_backlog_s=config.audio.max_backlog_s,
+        catchup_start_s=config.audio.catchup_start_s,
+        max_playback_rate=config.audio.max_playback_rate,
     )
     usage_logger = UsageLogger(config.logging.usage_log_path)
     session_id = usage_logger.new_session_id()  # shared with recordings below, so filenames line up with usage.csv
@@ -102,7 +114,11 @@ def _cmd_run(args: argparse.Namespace) -> None:
         recordings_dir = Path(config.logging.recordings_dir) / date_folder(session_id)
         for lang in config.languages:
             router.start_recording(lang.output_channel, recordings_dir / f"{session_id}-{lang.code}.wav")
-        print(f"Recording full session to {recordings_dir}/{session_id}-<lang>.wav")
+        # The English feed too, on the same timeline as the outputs: without it
+        # the delay can only be estimated by ear, and the service cannot be
+        # replayed offline afterwards.
+        router.start_input_recording(recordings_dir / f"{session_id}-source.wav")
+        print(f"Recording full session to {recordings_dir}/{session_id}-<lang>.wav (+ -source.wav)")
 
     if config.pipeline.mode == "passthrough":
         pipeline = Pipeline(config, router, usage_logger, session_id=session_id)
@@ -133,6 +149,11 @@ def _cmd_run(args: argparse.Namespace) -> None:
         underruns = router.underrun_report()
         if any(underruns.values()):
             print(f"[audio] output underruns per channel (silence padding, not a crash): {underruns}")
+        dropped = router.dropped_report()
+        if any(dropped.values()):
+            # The operator's tuning signal: anything above the odd one or two
+            # means max_backlog_s is too tight for how fast the voice speaks.
+            print(f"[audio] пропущено целых реплик по каналам (отставание > {config.audio.max_backlog_s:.0f}с): {dropped}")
         print("Stopped.")
 
 
@@ -203,6 +224,66 @@ def _cmd_clone_voice(args: argparse.Namespace) -> None:
         print(f"Assigned {voice.id} to: {', '.join(l.code for l in matched)} in {config_path}")
 
 
+def _cmd_replay(args: argparse.Namespace) -> None:
+    """Run a WAV through the whole pipeline with no sound card attached.
+
+    The point is to stop finding output-path bugs during a service. Everything
+    real runs — AssemblyAI, Claude, Cartesia, and AudioRouter's own callback with
+    its skip rules — only the Scarlett is replaced by a file at each end.
+    """
+    from .replay import OfflineRouter, read_wav_mono, replay
+
+    config = load_config(args.config)
+    source = read_wav_mono(Path(args.input), config.audio.samplerate)
+
+    router = OfflineRouter(
+        input_device=None,
+        output_device=None,
+        samplerate=config.audio.samplerate,
+        blocksize=config.audio.blocksize,
+        input_channel=config.audio.input_channel,
+        output_channels=[lang.output_channel for lang in config.languages],
+        max_backlog_s=config.audio.max_backlog_s,
+        catchup_start_s=config.audio.catchup_start_s,
+        max_playback_rate=config.audio.max_playback_rate,
+    )
+    usage_logger = UsageLogger(config.logging.usage_log_path)
+    session_id = usage_logger.new_session_id().replace("svc-", "replay-")
+
+    if args.voice:
+        for lang in config.languages:
+            lang.voice_id = args.voice  # A/B a stock voice against the clone on identical input
+        print(f"voice override: every language uses {args.voice}")
+
+    if config.pipeline.mode == "mock":
+        pipeline = _build_mock_pipeline(config, router, usage_logger, session_id)
+    else:
+        pipeline = _build_real_pipeline(config, router, usage_logger, session_id)
+
+    print(f"replaying {args.input} ({len(source) / config.audio.samplerate:.0f}s) at wall-clock pace, "
+          f"session {session_id}")
+    pipeline.start()
+    try:
+        written = replay(config, router, source, Path(args.out_dir), session_id, drain_s=args.drain)
+    finally:
+        pipeline.stop()
+        router.stop()
+
+    src_s = len(source) / config.audio.samplerate
+    print()
+    for code, info in written.items():
+        # `voiced` is what a listener would actually have heard; the gap between
+        # that and the source length is the translation that never made it out.
+        print(f"  [{code}] {info['path']}  {info['voiced_s']:.0f}s heard of {src_s:.0f}s spoken "
+              f"({100 * info['voiced_s'] / src_s:.0f}% channel load)")
+    dropped = router.dropped_report()
+    if any(dropped.values()):
+        print(f"  пропущено целых реплик: {dropped}")
+    underruns = router.underrun_report()
+    print(f"  underruns (тишина в паузах — норма): {underruns}")
+    print("\nПослушайте файлы выше — это ровно то, что услышал бы слушатель.")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="church-translator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -214,6 +295,17 @@ def main(argv: list[str] | None = None) -> None:
     run_parser = sub.add_parser("run", help="run the translation pipeline")
     run_parser.add_argument("--config", required=True, help="path to config.yaml")
     run_parser.set_defaults(func=_cmd_run)
+
+    replay_parser = sub.add_parser(
+        "replay", help="run a wav file through the pipeline with no sound card, write the channel outputs"
+    )
+    replay_parser.add_argument("--config", required=True, help="path to config.yaml")
+    replay_parser.add_argument("--input", required=True, help="16-bit wav at the config samplerate")
+    replay_parser.add_argument("--out-dir", default="replay-out", help="where to write one wav per language")
+    replay_parser.add_argument("--voice", help="override every language's voice_id (A/B a stock voice vs the clone)")
+    replay_parser.add_argument("--drain", type=float, default=45.0,
+                               help="seconds to keep playing after the input ends, so the tail is not cut")
+    replay_parser.set_defaults(func=_cmd_replay)
 
     sample_parser = sub.add_parser("record-sample", help="record a clean clip for voice cloning")
     sample_parser.add_argument("--config", required=True, help="path to config.yaml")

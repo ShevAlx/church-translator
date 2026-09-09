@@ -14,6 +14,7 @@ dated pins); "sonic-latest" is the forward-safe choice.
 
 from __future__ import annotations
 
+import base64
 import os
 from collections.abc import Iterator
 
@@ -23,12 +24,22 @@ from .base import TTSProvider
 
 
 class CartesiaTTS(TTSProvider):
-    def __init__(self, samplerate: int, model: str = "sonic-latest", api_key: str | None = None):
+    def __init__(
+        self,
+        samplerate: int,
+        model: str = "sonic-latest",
+        api_key: str | None = None,
+        speed: str = "normal",
+    ):
         from cartesia import Cartesia
 
         self._client = Cartesia(api_key=api_key or os.environ["CARTESIA_API_KEY"])
         self.samplerate = samplerate
         self._model = model
+        # Passed through per config.TTSConfig. Note that "fast" measured as a
+        # no-op on sonic-latest with the cloned voice (2026-09-06) — it is here
+        # as a knob, not as a working fix for channel overload.
+        self._speed = speed
 
     def synthesize(self, text: str, voice_id: str, language_code: str) -> np.ndarray:
         if not text.strip() or not voice_id:
@@ -41,13 +52,20 @@ class CartesiaTTS(TTSProvider):
             voice=voice_id,  # str is a valid VoiceSpecifierParam — must stay the SAME id every
                               # call for a given language/session (report §04.1 "locked voice" fix)
             language=language_code,
+            speed=self._speed,
         )
         return np.frombuffer(response.read(), dtype=np.float32)
 
     def synthesize_stream(self, text: str, voice_id: str, language_code: str) -> Iterator[np.ndarray]:
         """Server-sent-events variant: audio starts arriving in ~0.2s instead of
         after the whole utterance is rendered. Same voice, same billing (Cartesia
-        charges per character either way) — only the wait changes."""
+        charges per character either way) — only the wait changes.
+
+        `TTSSSEChunkEvent.data` is a base64 **str**, not raw bytes (verified
+        against the live API 2026-09-06 — the first version of this method
+        assumed bytes and raised TypeError on the very first chunk, which is why
+        nothing had ever called it). Decode before touching the PCM.
+        """
         if not text.strip() or not voice_id:
             return
 
@@ -57,14 +75,16 @@ class CartesiaTTS(TTSProvider):
             transcript=text,
             voice={"mode": "id", "id": voice_id},
             language=language_code,
+            speed=self._speed,
             output_format={"container": "raw", "encoding": "pcm_f32le", "sample_rate": self.samplerate},
         ):
             data = getattr(chunk, "data", None)
             if not data:
-                continue
+                continue  # non-audio events (done/timestamps) carry no `data`
+            pcm = base64.b64decode(data) if isinstance(data, str) else data
             # float32 is 4 bytes; SSE chunk boundaries do not respect that, so a
             # partial sample is carried over rather than misaligning the stream.
-            buf = tail + data
+            buf = tail + pcm
             usable = len(buf) - (len(buf) % 4)
             tail = buf[usable:]
             if usable:

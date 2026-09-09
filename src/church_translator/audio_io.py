@@ -1,4 +1,4 @@
-"""Real-time duplex audio I/O — report §09 "Будка и звуковая карта".
+"""Real-time duplex audio I/O — report §09 "The booth and the audio interface".
 
 One input channel (the mixer's AUX/direct-out feed) goes in; each configured
 language writes into its own dedicated output channel on the same interface.
@@ -11,13 +11,14 @@ this report budgeted for translation without ever stalling the audio device.
 
 If a language's output buffer runs dry (worker still thinking, or crashed),
 the callback pads with silence rather than blocking or repeating audio —
-this is the "проходной сигнал или тишина, не зависание" rule from §09.
+this is the "pass the signal through or output silence, never freeze" rule from §09.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
+import time
 import wave
 from collections import deque
 from pathlib import Path
@@ -110,6 +111,9 @@ class AudioRouter:
         input_channel: int,
         output_channels: list[int],
         max_backlog_s: float = 4.0,
+        catchup_start_s: float = 2.0,
+        max_playback_rate: float = 1.12,
+        time_fn=time.monotonic,
     ):
         self.input_device = input_device
         self.output_device = output_device
@@ -118,6 +122,13 @@ class AudioRouter:
         self.input_channel = input_channel
         self.output_channels = output_channels
         self.max_backlog_s = max_backlog_s
+        self.catchup_start_s = catchup_start_s
+        self.max_playback_rate = max_playback_rate
+        self._catchup_frames = 0  # blocks spent compressing, for the post-service report
+        # Injectable so lag behaviour can be simulated faster than real time —
+        # a drift bug takes minutes of wall clock to show up otherwise, which is
+        # exactly why the last two were found during a service instead of before.
+        self._now = time_fn
         self._max_out_channel = max(output_channels) + 1
 
         # Consumed by the STT worker: raw mono float32 chunks from the mixer feed.
@@ -125,15 +136,35 @@ class AudioRouter:
 
         # Filled by each language's TTS worker; drained by the callback every block.
         self._out_lock = threading.Lock()
-        # (utterance_id, samples). The id groups the chunks of one utterance so the
-        # backlog cap can drop whole utterances instead of decapitating the current one.
-        self._out_buffers: dict[int, deque[tuple[int, np.ndarray]]] = {ch: deque() for ch in output_channels}
+        # (utterance_id, samples, source_time). The id groups every chunk of one
+        # spoken turn so the backlog cap skips whole thoughts instead of cutting
+        # into one; source_time is when the speaker actually said it.
+        self._out_buffers: dict[int, deque[tuple[int, np.ndarray, float]]] = {
+            ch: deque() for ch in output_channels
+        }
 
         self._stream: sd.Stream | None = None
         self._underrun_count = {ch: 0 for ch in output_channels}
         self._dropped_count = {ch: 0 for ch in output_channels}
         self._next_utterance_id = 0
+        self._id_lock = threading.Lock()
+        # The utterance each channel is in the middle of playing. The backlog cap
+        # must never drop this one — see push_output.
+        self._playing_uid: dict[int, int | None] = {ch: None for ch in output_channels}
         self._recorders: dict[int, ChannelRecorder] = {}
+        self._input_recorder: ChannelRecorder | None = None
+
+    def allocate_utterance_id(self) -> int:
+        """Reserve an id before the first chunk of a streaming utterance exists.
+
+        A streaming TTS provider delivers one sentence as many small chunks;
+        they all have to carry the same id or the backlog cap treats each chunk
+        as its own utterance and happily drops half a sentence.
+        """
+        with self._id_lock:
+            uid = self._next_utterance_id
+            self._next_utterance_id += 1
+        return uid
 
     # -- one continuous recording per channel, for the whole session --------
 
@@ -142,40 +173,63 @@ class AudioRouter:
             raise ValueError(f"channel {channel} is not one of the configured output_channels")
         self._recorders[channel] = ChannelRecorder(path, self.samplerate)
 
+    def start_input_recording(self, path: Path) -> None:
+        """Record the mixer feed itself, alongside the output channels.
+
+        Both are written from the same callback invocation, so the input file
+        and every output file share one timeline sample for sample. That is what
+        makes delay *measurable* instead of estimated: open the two in any audio
+        editor and read the offset between a phrase and its translation.
+
+        It also turns any service into replay material — `church-translator
+        replay --input <this file>` re-runs it through the whole pipeline
+        offline, so a fix can be checked on real speech without a service.
+        """
+        self._input_recorder = ChannelRecorder(path, self.samplerate)
+
     # -- called from language worker threads --------------------------------
 
-    def push_output(self, channel: int, samples: np.ndarray, utterance_id: int | None = None) -> None:
+    def push_output(
+        self,
+        channel: int,
+        samples: np.ndarray,
+        utterance_id: int | None = None,
+        source_time: float | None = None,
+    ) -> None:
         """Queue synthesized audio for `channel`. Safe to call from any thread.
 
-        The queue is capped at `max_backlog_s`. This is not a memory guard — it
-        is what keeps live interpretation *live*. Synthesized speech routinely
-        runs longer than the original (measured 2026-08-23 on a real service:
-        107% channel load — 173s of Russian audio for 162s of speech), so an
-        unbounded queue drifts further behind the speaker every minute: +11s of
-        lag in the first 2.5 minutes, and it never recovers on its own. Past the
-        cap the OLDEST whole utterances are dropped, never the newest — a
-        listener a few seconds behind and current is useful; a listener a minute
-        behind is translating the previous paragraph.
+        `utterance_id` groups everything belonging to one spoken turn — every
+        SSE chunk, and every sentence the turn was split into for translation.
+        `source_time` is time.monotonic() when the speaker finished that turn.
+
+        Staleness is decided at playback (see _callback), not here, and this is
+        the whole point. Two earlier versions got it wrong:
+
+        1. Drop the oldest whenever the queue exceeds the cap. The oldest is the
+           sentence currently in the listener's ears, so every new sentence cut
+           the current one off mid-word — 55% of the 2026-09-06 service lost.
+        2. Keep the playing one and the newest, drop the queue in between. But
+           streaming TTS delivers a whole turn's audio in ~3s of wall clock,
+           so a 23s turn lands in a 10s buffer instantly and the middle sentence
+           of a single thought was dropped while the listener was not behind at
+           all — measured 40% loss on a 49s test with only 78% channel load.
+
+        Queue depth simply is not lag: it counts audio that arrived early just
+        the same as audio the listener is behind on. Real lag is wall-clock
+        distance from when the words were spoken, which is what _callback uses.
         """
         if channel not in self._out_buffers:
             raise ValueError(f"channel {channel} is not one of the configured output_channels")
-        limit = int(self.max_backlog_s * self.samplerate)
         with self._out_lock:
-            buf = self._out_buffers[channel]
-            uid = self._next_utterance_id if utterance_id is None else utterance_id
             if utterance_id is None:
-                self._next_utterance_id += 1
-            buf.append((uid, samples.astype(np.float32, copy=False)))
-            queued = sum(len(chunk) for _, chunk in buf)
-            # Drop whole utterances, oldest first, and never the one being pushed:
-            # a streaming provider delivers one utterance as many small chunks, and
-            # trimming those individually would cut off the front of a sentence
-            # mid-word instead of skipping a stale sentence outright.
-            while queued > limit and buf[0][0] != uid:
-                stale = buf[0][0]
-                while buf and buf[0][0] == stale:
-                    queued -= len(buf.popleft()[1])
-                self._dropped_count[channel] += 1
+                with self._id_lock:
+                    uid = self._next_utterance_id
+                    self._next_utterance_id += 1
+            else:
+                uid = utterance_id
+            self._out_buffers[channel].append(
+                (uid, samples.astype(np.float32, copy=False), source_time if source_time is not None else 0.0)
+            )
 
     # -- PortAudio callback (real-time thread — must not block) -------------
 
@@ -184,29 +238,75 @@ class AudioRouter:
             # Overflow/underflow flags from PortAudio itself — surfaced, not swallowed.
             print(f"[audio] stream status: {status}")
 
+        mic = indata[:, self.input_channel].copy()
+        if self._input_recorder is not None:
+            self._input_recorder.push(mic)  # same block as the outputs -> aligned timelines
         try:
-            self.input_queue.put_nowait(indata[:, self.input_channel].copy())
+            self.input_queue.put_nowait(mic)
         except queue.Full:
             pass  # STT worker is behind; drop this block rather than block the callback
 
         outdata[:] = 0.0
+        now = self._now()
         with self._out_lock:
             for ch in self.output_channels:
                 buf = self._out_buffers[ch]
-                filled = 0
-                while buf and filled < frames:
-                    uid, chunk = buf[0]
-                    take = min(len(chunk), frames - filled)
-                    outdata[filled : filled + take, ch] = chunk[:take]
-                    if take == len(chunk):
-                        buf.popleft()
-                    else:
-                        buf[0] = (uid, chunk[take:])
-                    filled += take
-                if filled < frames:
+                # How far behind the speaker the audio about to play actually is.
+                lag = now - buf[0][2] if buf and buf[0][2] else 0.0
+                rate = 1.0
+                if lag > self.catchup_start_s and self.max_playback_rate > 1.0:
+                    rate = min(self.max_playback_rate, 1.0 + (lag - self.catchup_start_s) * 0.05)
+                need = int(round(frames * rate))
+
+                taken = self._take(ch, buf, need, now)
+                if len(taken) == 0:
                     self._underrun_count[ch] += 1  # silence padding — expected occasionally, not a crash
+                elif len(taken) >= need and rate > 1.0:
+                    # Linear resample: `need` samples of speech compressed into
+                    # `frames` of output. Cheap enough for the real-time thread,
+                    # and the pitch rise stays under ~2 semitones at the cap.
+                    outdata[:, ch] = np.interp(
+                        np.linspace(0.0, len(taken) - 1.0, frames), np.arange(len(taken)), taken
+                    )
+                    self._catchup_frames += 1
+                else:
+                    # Buffer ran dry mid-block: play what we have at normal speed
+                    # rather than stretching a short read into a full block.
+                    outdata[: len(taken), ch] = taken[:frames]
+                    if len(taken) < frames:
+                        self._underrun_count[ch] += 1
                 if ch in self._recorders:
                     self._recorders[ch].push(outdata[:frames, ch].copy())
+
+    def _take(self, ch: int, buf, need: int, now: float) -> np.ndarray:
+        """Pull up to `need` samples, skipping whole turns that are already too
+        stale to be worth playing. Called with `_out_lock` held.
+
+        Staleness is judged only when stepping into a NEW turn: a turn already
+        being spoken always finishes, because cutting into one is what made the
+        translation lose its thread mid-thought.
+        """
+        out: list[np.ndarray] = []
+        filled = 0
+        while buf and filled < need:
+            uid, chunk, source_time = buf[0]
+            if uid != self._playing_uid[ch]:
+                if source_time and now - source_time > self.max_backlog_s:
+                    while buf and buf[0][0] == uid:
+                        buf.popleft()
+                    self._dropped_count[ch] += 1
+                    continue  # skip this whole thought, try the next one
+                self._playing_uid[ch] = uid
+            take = min(len(chunk), need - filled)
+            out.append(chunk[:take])
+            if take == len(chunk):
+                buf.popleft()
+            else:
+                buf[0] = (uid, chunk[take:], source_time)
+            filled += take
+        if not out:
+            return np.zeros(0, dtype=np.float32)
+        return out[0] if len(out) == 1 else np.concatenate(out)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -228,10 +328,17 @@ class AudioRouter:
         for rec in self._recorders.values():
             rec.close()
         self._recorders.clear()
+        if self._input_recorder is not None:
+            self._input_recorder.close()
+            self._input_recorder = None
 
     def underrun_report(self) -> dict[int, int]:
         return dict(self._underrun_count)
 
     def dropped_report(self) -> dict[int, int]:
-        """Utterances skipped per channel to stay current (see push_output)."""
+        """Whole turns skipped per channel to stay current (see _take)."""
         return dict(self._dropped_count)
+
+    def catchup_report(self) -> float:
+        """Seconds of output that were played compressed to claw back lag."""
+        return self._catchup_frames * self.blocksize / self.samplerate
