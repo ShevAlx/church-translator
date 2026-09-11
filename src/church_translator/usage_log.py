@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import shutil
 import threading
 from pathlib import Path
 
@@ -61,3 +62,25 @@ def date_folder(session_id: str) -> str:
     # No date in the id (a hand-made session name in a test) — one folder for
     # those beats scattering half-parsed garbage directories through logs/.
     return "undated"
+
+
+def prune_dated_folders(root: str | Path | None, keep_days: int) -> int:
+    """Delete the YYYY-MM-DD folders under `root` (see date_folder) older than
+    `keep_days`; anything not named like a date is left alone. Returns how many
+    went. keep_days <= 0 keeps everything."""
+    if not root or keep_days <= 0:
+        return 0
+    base = Path(root)
+    if not base.is_dir():
+        return 0
+    cutoff = dt.date.today() - dt.timedelta(days=keep_days)
+    removed = 0
+    for child in base.iterdir():
+        try:
+            day = dt.date.fromisoformat(child.name)
+        except ValueError:
+            continue
+        if child.is_dir() and day < cutoff:
+            shutil.rmtree(child, ignore_errors=True)
+            removed += 1
+    return removed

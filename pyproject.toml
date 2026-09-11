@@ -7,7 +7,9 @@ dependencies = [
     "sounddevice>=0.4.7",
     "numpy>=1.26",
     "pyyaml>=6.0",
-    "rumps>=0.4.0",
+    # Menu-bar app only. The booth Pi runs Linux and is driven by the Telegram
+    # bot instead; rumps pulls in pyobjc, which does not build there.
+    "rumps>=0.4.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +28,7 @@ providers = [
 [project.scripts]
 church-translator = "church_translator.cli:main"
 church-translator-app = "church_translator.menubar_app:run"
+church-translator-bot = "church_translator.telegram_bot:main"
 
 [build-system]
 requires = ["hatchling"]

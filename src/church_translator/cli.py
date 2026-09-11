@@ -11,11 +11,11 @@ from pathlib import Path
 
 import sounddevice as sd
 
-from .audio_io import AudioRouter, list_devices, resolve_device
+from .audio_io import list_devices, resolve_device
 from .config import load_config, save_config
-from .pipeline import Pipeline, _write_debug_wav
-from .providers.mock import MockMT, MockSTT, MockTTS
-from .usage_log import UsageLogger, date_folder
+from .pipeline import _write_debug_wav
+from .session import LiveSession, build_pipeline
+from .usage_log import UsageLogger
 
 try:
     from dotenv import load_dotenv
@@ -34,106 +34,15 @@ def _cmd_list_devices(_args: argparse.Namespace) -> None:
     )
 
 
-def _build_mock_pipeline(config, router, usage_logger, session_id) -> Pipeline:
-    stt = MockSTT(samplerate=config.audio.samplerate)
-    mt_by_lang = {lang.code: MockMT() for lang in config.languages}
-    tts_by_lang = {
-        lang.code: MockTTS(samplerate=config.audio.samplerate, base_hz=440.0 * (i + 1))
-        for i, lang in enumerate(config.languages)
-    }
-    return Pipeline(
-        config, router, usage_logger, stt=stt, mt_by_language=mt_by_lang, tts_by_language=tts_by_lang,
-        debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id,
-    )
-
-
-def _build_real_pipeline(config, router, usage_logger, session_id) -> Pipeline:
-    # Milestone 2 — needs `pip install "church-translator[providers]"` plus
-    # ASSEMBLYAI_API_KEY / ANTHROPIC_API_KEY / CARTESIA_API_KEY (see README).
-    try:
-        from .providers.assemblyai_stt import AssemblyAISTT
-        from .providers.cartesia_tts import CartesiaTTS
-        from .providers.claude_mt import ClaudeMT
-    except ImportError as exc:
-        raise SystemExit(
-            "pipeline.mode is 'real' but the provider extras aren't installed.\n"
-            "Run: uv sync --extra providers\n"
-            f"(import error: {exc})"
-        ) from exc
-
-    # Constrain STT to what the speaker is expected to say (config.source_languages),
-    # NOT to the output/target languages — those are what MT produces, never what
-    # STT needs to recognize. Conflating the two breaks as soon as source and
-    # target differ: live-tested 2026-08-19, AssemblyAI's streaming API flatly
-    # rejects "uk" as a source candidate (code=3006) even though Cartesia
-    # synthesizes Ukrainian output fine — source and target are different sets
-    # with different constraints, on purpose.
-    stt = AssemblyAISTT(
-        samplerate=config.audio.samplerate,
-        language_codes=config.source_languages or None,
-        end_of_turn_confidence_threshold=config.stt.end_of_turn_confidence_threshold,
-        min_turn_silence_ms=config.stt.min_turn_silence_ms,
-        max_turn_silence_ms=config.stt.max_turn_silence_ms,
-        partial_emit=config.stt.partial_emit,
-        partial_min_words=config.stt.partial_min_words,
-        partial_max_words=config.stt.partial_max_words,
-        partial_gap_ms=config.stt.partial_gap_ms,
-    )
-    mt_by_lang = {lang.code: ClaudeMT() for lang in config.languages}
-    tts_by_lang = {
-        lang.code: CartesiaTTS(
-            samplerate=config.audio.samplerate, model=config.tts.model, speed=config.tts.speed,
-            continuous=config.tts.continuous_context,
-        )
-        for lang in config.languages
-    }
-    return Pipeline(
-        config, router, usage_logger, stt=stt, mt_by_language=mt_by_lang, tts_by_language=tts_by_lang,
-        debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id,
-    )
-
-
 def _cmd_run(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    input_device_index = resolve_device(config.audio.input_device, kind="input")
-    output_source = config.audio.output_device or config.audio.input_device
-    output_device_index = resolve_device(output_source, kind="output")
-
-    router = AudioRouter(
-        input_device=input_device_index,
-        output_device=output_device_index,
-        samplerate=config.audio.samplerate,
-        blocksize=config.audio.blocksize,
-        input_channel=config.audio.input_channel,
-        output_channels=[lang.output_channel for lang in config.languages],
-        max_backlog_s=config.audio.max_backlog_s,
-        catchup_start_s=config.audio.catchup_start_s,
-        max_playback_rate=config.audio.max_playback_rate,
-    )
-    usage_logger = UsageLogger(config.logging.usage_log_path)
-    session_id = usage_logger.new_session_id()  # shared with recordings below, so filenames line up with usage.csv
-
-    if config.logging.recordings_dir:
-        recordings_dir = Path(config.logging.recordings_dir) / date_folder(session_id)
-        for lang in config.languages:
-            router.start_recording(lang.output_channel, recordings_dir / f"{session_id}-{lang.code}.wav")
-        # The English feed too, on the same timeline as the outputs: without it
-        # the delay can only be estimated by ear, and the service cannot be
-        # replayed offline afterwards.
-        router.start_input_recording(recordings_dir / f"{session_id}-source.wav")
-        print(f"Recording full session to {recordings_dir}/{session_id}-<lang>.wav (+ -source.wav)")
-
-    if config.pipeline.mode == "passthrough":
-        pipeline = Pipeline(config, router, usage_logger, session_id=session_id)
-    elif config.pipeline.mode == "mock":
-        pipeline = _build_mock_pipeline(config, router, usage_logger, session_id)
-    elif config.pipeline.mode == "real":
-        pipeline = _build_real_pipeline(config, router, usage_logger, session_id)
-    else:
-        raise SystemExit(f"unknown pipeline.mode: {config.pipeline.mode!r}")
-
-    router.start()
-    pipeline.start()
+    try:
+        session = LiveSession(config)
+        session.start()
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    if session.recordings_dir:
+        print(f"Recording full session to {session.recordings_dir}/{session.session_id}-<lang>.wav (+ -source.wav)")
     print("Ctrl+C to stop.")
 
     stop = False
@@ -147,16 +56,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
         while not stop:
             time.sleep(1.0)
     finally:
-        pipeline.stop()
-        router.stop()
-        underruns = router.underrun_report()
-        if any(underruns.values()):
-            print(f"[audio] output underruns per channel (silence padding, not a crash): {underruns}")
-        dropped = router.dropped_report()
-        if any(dropped.values()):
+        report = session.stop()
+        if any(report.underruns.values()):
+            print(f"[audio] output underruns per language (silence padding, not a crash): {report.underruns}")
+        if any(report.dropped.values()):
             # The operator's tuning signal: anything above the odd one or two
             # means max_backlog_s is too tight for how fast the voice speaks.
-            print(f"[audio] whole turns skipped per channel (lag > {config.audio.max_backlog_s:.0f}s): {dropped}")
+            print(f"[audio] whole turns skipped per language (lag > {config.audio.max_backlog_s:.0f}s): {report.dropped}")
         print("Stopped.")
 
 
@@ -248,10 +154,7 @@ def _cmd_replay(args: argparse.Namespace) -> None:
             lang.voice_id = args.voice  # A/B a stock voice against the clone on identical input
         print(f"voice override: every language uses {args.voice}")
 
-    if config.pipeline.mode == "mock":
-        pipeline = _build_mock_pipeline(config, router, usage_logger, session_id)
-    else:
-        pipeline = _build_real_pipeline(config, router, usage_logger, session_id)
+    pipeline = build_pipeline(config, router, usage_logger, session_id)
 
     print(f"replaying {args.input} ({len(source) / config.audio.samplerate:.0f}s) at wall-clock pace, "
           f"session {session_id}")

@@ -154,6 +154,34 @@ class LoggingConfig:
     # the sermon translation as one file" output, separate from the
     # per-utterance debug_audio_dir dump above.
     recordings_dir: str | None = None
+    # Per-date folders under recordings_dir / debug_audio_dir older than this
+    # many days are deleted by the Telegram bot at boot and after every ⏹.
+    # A 2-hour service is ~2 GB of WAV (source + one file per language), which
+    # a Pi's SD card cannot hold forever. 0 = keep everything (the Mac default).
+    keep_days: int = 0
+
+
+@dataclass
+class BotConfig:
+    """How the Telegram bot (telegram_bot.py) runs an unattended booth.
+
+    Only the bot reads this section. The menu bar and `run` have a person in
+    front of them who sees ⚠️/🐢 and presses ⏹/▶️; on the Pi nobody does, so the
+    bot does that same restart itself and messages what happened.
+    """
+
+    # Restart the session on a dead recognition link, a vanished sound card, or
+    # a lag that will not clear — the operator guide's manual "⏹ then ▶️".
+    auto_recover: bool = True
+    max_recoveries: int = 5          # within recovery_window_min, then a human decides
+    recovery_window_min: float = 15.0
+    retry_after_s: float = 30.0      # a failed restart (no internet yet) is retried this often...
+    retry_give_up_min: float = 10.0  # ...for this long, then the bot stops and says so
+    lag_recover_after_s: float = 60.0  # 🐢 held this long -> restart
+    silence_alert_s: float = 180.0   # mixer feed silent this long while running -> message; 0 = off
+    # A forgotten ▶️ stops by itself: AssemblyAI bills the open connection by
+    # the minute whether anyone is speaking or not. 0 = never.
+    max_session_hours: float = 3.0
 
 
 @dataclass
@@ -170,6 +198,7 @@ class AppConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    bot: BotConfig = field(default_factory=BotConfig)
 
     def validate(self) -> None:
         if not self.languages:
@@ -192,6 +221,10 @@ class AppConfig:
             )
         if not 0 < self.tts.pace_normal_wps < self.tts.pace_fast_wps:
             raise ValueError("need 0 < tts.pace_normal_wps < tts.pace_fast_wps")
+        if self.logging.keep_days < 0:
+            raise ValueError("logging.keep_days must be >= 0 (0 = keep everything)")
+        if self.bot.max_recoveries < 0 or self.bot.retry_after_s <= 0:
+            raise ValueError("need bot.max_recoveries >= 0 and bot.retry_after_s > 0")
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -204,10 +237,11 @@ def load_config(path: str | Path) -> AppConfig:
     stt = STTConfig(**raw.get("stt", {}))
     tts = TTSConfig(**raw.get("tts", {}))
     logging_cfg = LoggingConfig(**raw.get("logging", {}))
+    bot = BotConfig(**raw.get("bot", {}))
 
     cfg = AppConfig(
         audio=audio, source_languages=source_languages, languages=languages,
-        pipeline=pipeline, stt=stt, tts=tts, logging=logging_cfg,
+        pipeline=pipeline, stt=stt, tts=tts, logging=logging_cfg, bot=bot,
     )
     cfg.validate()
     return cfg

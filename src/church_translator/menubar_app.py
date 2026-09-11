@@ -16,17 +16,13 @@ window app.
 from __future__ import annotations
 
 import subprocess
-import time
 from pathlib import Path
 
 import rumps
 import sounddevice as sd
 
-from .audio_io import AudioRouter, resolve_device
-from .config import AppConfig, LanguageConfig, load_config, save_config
-from .pipeline import Pipeline
-from .providers.mock import MockMT, MockSTT, MockTTS
-from .usage_log import UsageLogger, date_folder
+from .config import AppConfig, load_config, save_config
+from .session import LiveSession
 
 CONFIG_PATH = Path("config.yaml")
 DEFAULT_TEMPLATE_PATH = Path("config.church.example.yaml")
@@ -57,9 +53,7 @@ class ChurchTranslatorApp(rumps.App):
             pass
 
         self.config = _load_or_seed_config()
-        self.router: AudioRouter | None = None
-        self.pipeline: Pipeline | None = None
-        self.session_start: float | None = None
+        self.session: LiveSession | None = None
         self._warned_stt = False
 
         self.status_item = rumps.MenuItem("○ Stopped")
@@ -183,7 +177,7 @@ class ChurchTranslatorApp(rumps.App):
 
     @property
     def running(self) -> bool:
-        return self.pipeline is not None
+        return self.session is not None
 
     def toggle_run(self, sender) -> None:
         if not self.running:
@@ -193,96 +187,24 @@ class ChurchTranslatorApp(rumps.App):
 
     def _start(self) -> None:
         try:
-            input_idx = resolve_device(self.config.audio.input_device, kind="input")
-            output_source = self.config.audio.output_device or self.config.audio.input_device
-            output_idx = resolve_device(output_source, kind="output")
-
-            self.router = AudioRouter(
-                input_device=input_idx,
-                output_device=output_idx,
-                samplerate=self.config.audio.samplerate,
-                blocksize=self.config.audio.blocksize,
-                input_channel=self.config.audio.input_channel,
-                output_channels=[lang.output_channel for lang in self.config.languages],
-                max_backlog_s=self.config.audio.max_backlog_s,
-                catchup_start_s=self.config.audio.catchup_start_s,
-                max_playback_rate=self.config.audio.max_playback_rate,
-            )
-            usage_logger = UsageLogger(self.config.logging.usage_log_path)
-            session_id = usage_logger.new_session_id()
-
-            if self.config.logging.recordings_dir:
-                recordings_dir = Path(self.config.logging.recordings_dir) / date_folder(session_id)
-                for lang in self.config.languages:
-                    self.router.start_recording(lang.output_channel, recordings_dir / f"{session_id}-{lang.code}.wav")
-                # Same timeline as the outputs — this is what makes the delay
-                # measurable after the fact, and makes the service replayable.
-                self.router.start_input_recording(recordings_dir / f"{session_id}-source.wav")
-
-            if self.config.pipeline.mode == "mock":
-                stt = MockSTT(samplerate=self.config.audio.samplerate)
-                mt_by_lang = {lang.code: MockMT() for lang in self.config.languages}
-                tts_by_lang = {
-                    lang.code: MockTTS(samplerate=self.config.audio.samplerate, base_hz=440.0 * (i + 1))
-                    for i, lang in enumerate(self.config.languages)
-                }
-            else:
-                from .providers.assemblyai_stt import AssemblyAISTT
-                from .providers.cartesia_tts import CartesiaTTS
-                from .providers.claude_mt import ClaudeMT
-
-                stt = AssemblyAISTT(
-                    samplerate=self.config.audio.samplerate,
-                    language_codes=self.config.source_languages or None,
-                    end_of_turn_confidence_threshold=self.config.stt.end_of_turn_confidence_threshold,
-                    min_turn_silence_ms=(
-                        self.config.stt.min_turn_silence_ms
-                    ),
-                    max_turn_silence_ms=self.config.stt.max_turn_silence_ms,
-                    partial_emit=self.config.stt.partial_emit,
-                    partial_min_words=self.config.stt.partial_min_words,
-                    partial_max_words=self.config.stt.partial_max_words,
-                    partial_gap_ms=self.config.stt.partial_gap_ms,
-                )
-                mt_by_lang = {lang.code: ClaudeMT() for lang in self.config.languages}
-                tts_by_lang = {
-                    lang.code: CartesiaTTS(
-                        samplerate=self.config.audio.samplerate, model=self.config.tts.model, speed=self.config.tts.speed,
-                        continuous=self.config.tts.continuous_context,
-                    )
-                    for lang in self.config.languages
-                }
-
-            self.pipeline = Pipeline(
-                self.config, self.router, usage_logger,
-                stt=stt, mt_by_language=mt_by_lang, tts_by_language=tts_by_lang,
-                debug_audio_dir=self.config.logging.debug_audio_dir, session_id=session_id,
-            )
-            self.router.start()
-            self.pipeline.start()
-            self.session_start = time.monotonic()
-            self._warned_stt = False
-
-            self.toggle_item.title = "⏹ Stop translation"
-            self.title = "🔴"
-            self._tick(None)
+            session = LiveSession(self.config)
+            session.start()
         except Exception as exc:  # noqa: BLE001 — surface to the operator, don't just crash the menu bar
-            self.router = None
-            self.pipeline = None
             rumps.alert(f"Could not start: {exc}")
+            return
+        self.session = session
+        self._warned_stt = False
+        self.toggle_item.title = "⏹ Stop translation"
+        self.title = "🔴"
+        self._tick(None)
 
     def _stop(self) -> None:
-        if self.pipeline:
-            self.pipeline.stop()
-        if self.router:
-            underruns = self.router.underrun_report()
-            dropped = self.router.dropped_report()
-            self.router.stop()
+        if self.session is not None:
+            report = self.session.stop()
+            underruns, dropped = report.underruns, report.dropped
         else:
             underruns, dropped = {}, {}
-        self.pipeline = None
-        self.router = None
-        self.session_start = None
+        self.session = None
         self.toggle_item.title = "▶️ Start translation"
         self.title = "🎙️"
         self.status_item.title = "○ Stopped"
@@ -297,16 +219,16 @@ class ChurchTranslatorApp(rumps.App):
             rumps.notification("church-translator", "Stopped", f"Underruns per channel: {underruns}")
 
     def _tick(self, _sender) -> None:
-        if self.session_start is None:
+        if self.session is None:
             return
-        elapsed = int(time.monotonic() - self.session_start)
+        elapsed = int(self.session.elapsed_s)
         clock = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
 
         # A dead STT stream leaves everything else looking healthy — audio still
         # flows, every thread is still alive, the timer still counts up. Without
         # this the booth sees "● Running" while the headphones are silent
         # (happened for real during the 2026-08-23 pre-service check).
-        error = self.pipeline.stt_error if self.pipeline is not None else None
+        error = self.session.stt_error
         if error:
             self.title = "⚠️"
             self.status_item.title = f"⚠️ Recognition lost — {clock}"
@@ -319,7 +241,7 @@ class ChurchTranslatorApp(rumps.App):
             return
         # Past max_backlog_s the output buffer is already skipping whole turns,
         # so this is the point where the listener is actually losing sermon.
-        lag = self.pipeline.stt_lag_s if self.pipeline is not None else None
+        lag = self.session.stt_lag_s
         if lag is not None and lag > self.config.audio.max_backlog_s:
             self.title = "🐢"
             self.status_item.title = f"🐢 Lagging {lag:.0f}s — slow internet — {clock}"

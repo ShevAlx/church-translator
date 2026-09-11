@@ -1,0 +1,23 @@
+# systemd USER unit for the booth Pi — installed by deploy/deploy.sh into
+# ~/.config/systemd/user/. Runs without anyone logged in because linger is on
+# (`loginctl enable-linger`), and comes back by itself after a crash or reboot.
+[Unit]
+Description=church-translator: live translation controlled from Telegram
+# Ordering only: WirePlumber applies the rule that keeps PipeWire off the
+# Scarlett (deploy/wireplumber-scarlett.conf) when it starts.
+After=wireplumber.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/church-translator
+ExecStart=%h/church-translator/.venv/bin/church-translator-bot
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+# SIGTERM makes the bot stop a live session cleanly (the STT socket is billed
+# by the minute) and send its last message; give it time for both.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

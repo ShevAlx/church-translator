@@ -77,6 +77,19 @@ def list_devices() -> str:
     return "\n".join(lines)
 
 
+def refresh_devices() -> None:
+    """Make PortAudio look for devices again.
+
+    PortAudio snapshots the device list once, at initialization. On the booth
+    Pi the bot starts at boot, possibly before the Scarlett is plugged in or
+    powered — without a re-scan it would report "no device" until the bot
+    itself restarted. Only call this while no stream is open: re-initializing
+    tears down every PortAudio stream in the process.
+    """
+    sd._terminate()
+    sd._initialize()
+
+
 def resolve_device(name_substring: str | None, kind: str = "input") -> int | None:
     """Find a device index by case-insensitive substring match on its name,
     restricted to devices that actually have channels on the requested side.
@@ -97,6 +110,15 @@ def resolve_device(name_substring: str | None, kind: str = "input") -> int | Non
         f"no {kind} device matching {name_substring!r} with {kind} channels — "
         "try `church-translator list-devices`"
     )
+
+
+# Mixer-feed peak at or above this counts as "signal present" (about -50 dBFS):
+# above the noise floor of an idle X32 bus, well below any speech or music.
+SIGNAL_THRESHOLD = 0.003
+# Per-block decay of the input peak meter: with ~94 blocks/s at 48 kHz/512 the
+# held peak halves in about 3.7s — long enough to read a level off a status
+# message, short enough that a dead feed shows up as one.
+PEAK_HOLD_DECAY = 0.998
 
 
 class AudioRouter:
@@ -153,6 +175,12 @@ class AudioRouter:
         self._playing_uid: dict[int, int | None] = {ch: None for ch in output_channels}
         self._recorders: dict[int, ChannelRecorder] = {}
         self._input_recorder: ChannelRecorder | None = None
+
+        # Health, read from other threads. Plain float stores — a torn read is
+        # impossible in CPython and a stale one costs nothing.
+        self._last_callback_at: float | None = None
+        self._last_signal_at: float | None = None
+        self.input_peak = 0.0  # held peak of the mixer feed, 0-1
 
     def allocate_utterance_id(self) -> int:
         """Reserve an id before the first chunk of a streaming utterance exists.
@@ -244,7 +272,13 @@ class AudioRouter:
             # Overflow/underflow flags from PortAudio itself — surfaced, not swallowed.
             print(f"[audio] stream status: {status}")
 
+        now = self._now()
+        self._last_callback_at = now
         mic = indata[:, self.input_channel].copy()
+        peak = float(np.abs(mic).max()) if len(mic) else 0.0
+        self.input_peak = max(peak, self.input_peak * PEAK_HOLD_DECAY)
+        if peak >= SIGNAL_THRESHOLD:
+            self._last_signal_at = now
         if self._input_recorder is not None:
             self._input_recorder.push(mic)  # same block as the outputs -> aligned timelines
         try:
@@ -253,7 +287,6 @@ class AudioRouter:
             pass  # STT worker is behind; drop this block rather than block the callback
 
         outdata[:] = 0.0
-        now = self._now()
         with self._out_lock:
             for ch in self.output_channels:
                 buf = self._out_buffers[ch]
@@ -337,6 +370,15 @@ class AudioRouter:
         if self._input_recorder is not None:
             self._input_recorder.close()
             self._input_recorder = None
+
+    def seconds_since_callback(self) -> float | None:
+        """None until the first callback. A stream whose interface was pulled
+        simply stops calling back — PortAudio does not always say so."""
+        return None if self._last_callback_at is None else self._now() - self._last_callback_at
+
+    def seconds_since_signal(self) -> float | None:
+        """None if the mixer feed has not crossed SIGNAL_THRESHOLD since start."""
+        return None if self._last_signal_at is None else self._now() - self._last_signal_at
 
     def underrun_report(self) -> dict[int, int]:
         return dict(self._underrun_count)

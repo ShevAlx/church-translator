@@ -1,0 +1,51 @@
+# Booth Raspberry Pi, controlled from Telegram (see PI_SETUP.md):
+#   Behringer X32 --> Scarlett 2i2 --USB--> Pi --> Scarlett outputs --> FM transmitters
+#
+# Copy to config.yaml on the Pi. Nobody edits it from a menu there, so the
+# comments survive — unlike on the Mac, where the menu-bar app rewrites it.
+# The bot re-reads this file on every ▶️, so an edit needs no restart.
+
+audio:
+  # Under Linux/ALSA the card shows up as e.g. "Scarlett 2i2 USB: Audio (hw:3,0)";
+  # a substring is enough. /devices in the bot lists what the Pi actually sees.
+  input_device: "Scarlett"
+  output_device: "Scarlett"
+  samplerate: 48000
+  # 1024, not the Mac's 512: a Pi 4 with Python in the audio callback is
+  # safer against xruns at ~21ms per block, and 10ms more is nothing next to
+  # the seconds translation takes anyway.
+  blocksize: 1024
+  input_channel: 0   # L channel of the "copy of Main L/R" feed from the X32
+  max_backlog_s: 10.0
+
+source_languages:
+  - en
+
+languages:
+  - name: russian
+    code: ru
+    output_channel: 0   # -> Left output -> transmitter 1
+    voice_id: "1e4176b1-3db9-44d6-a601-4fe68b041942"   # Cartesia stock voice; replace with the pastor's clone
+  - name: ukrainian
+    code: uk
+    output_channel: 1   # -> Right output -> transmitter 2
+    voice_id: "05ffab9c-d380-4909-8375-cd12f59238c3"
+
+pipeline:
+  mode: real   # what ▶️ Старт runs; 🧪 Тест каналов is always mock
+
+logging:
+  usage_log_path: "./logs/usage.csv"
+  recordings_dir: "./logs/recordings"   # ~2 GB per 2-hour service (source + both languages)
+  # debug_audio_dir left off: per-utterance WAVs are for desk debugging on the Mac
+  keep_days: 21   # recordings older than 3 weeks are deleted at boot and after every ⏹
+
+bot:
+  auto_recover: true
+  max_recoveries: 5          # restarts per recovery_window_min before a human decides
+  recovery_window_min: 15
+  retry_after_s: 30          # restart failed (no internet yet)? try again this often...
+  retry_give_up_min: 10      # ...for this long
+  lag_recover_after_s: 60    # 🐢 over max_backlog_s this long -> restart
+  silence_alert_s: 180       # no signal from the mixer this long -> message (0 = off)
+  max_session_hours: 3       # forgotten ⏹ -> auto-stop (0 = never)

@@ -230,6 +230,24 @@ the app, reading the raw YAML stops being necessary.
 > The menu bar labels are in English; `OPERATOR_GUIDE.md` stays in Russian — it is written for
 > the volunteer running the booth during a service and quotes the English labels as they appear.
 
+## Booth Raspberry Pi, controlled from Telegram
+
+The permanent setup: a Raspberry Pi stays in the church with the Scarlett on USB and the network on
+a LAN cable, and `church-translator-bot` (a systemd user service) replaces the menu bar. Buttons in
+the Telegram chat start, stop and restart translation, and the bot reports what the menu bar icon
+used to show. Unlike the menu bar it also recovers on its own: a dead recognition link, a vanished
+sound card, or a lag that won't clear triggers the same "⏹ then ▶️" an operator would do, within the
+limits of the `bot:` config section. It also sends a message when the mixer feed goes silent, stops
+a session someone forgot to stop (AssemblyAI bills the open connection), and deletes recordings
+older than `logging.keep_days`.
+
+- Setup, church-day routine, messages and troubleshooting (in Russian): [PI_SETUP.md](PI_SETUP.md).
+- Pi config template: `config.pi.example.yaml`. Push code from the Mac with `deploy/deploy.sh`.
+- `session.py` builds and runs a session for all three front ends (`run`, the menu bar and the bot),
+  so a fix to how a session starts or stops lands in every one of them.
+- On Raspberry Pi OS with a desktop, PipeWire claims the Scarlett. `deploy/wireplumber-scarlett.conf`
+  disables just that card in PipeWire so ALSA can open it directly.
+
 ## Recording a voice sample for cloning
 
 ```bash
@@ -264,9 +282,5 @@ Ideas measured or discussed during the 2026-09-11 tests and deliberately left fo
   per segment (and `[mt] dropped …` events) would make every test reviewable afterwards.
 - **Calibrate the pace thresholds on a full service.** `pace_normal_wps`/`pace_fast_wps` (2.0/2.8)
   come from ~2 minutes of one preacher.
-- **Run on a Raspberry Pi with Telegram control.** Same quality and latency (all heavy work is in
-  the cloud); needs `rumps` made macOS-only in `pyproject.toml`, a Telegram bot in place of the menu
-  bar (start/stop/status, alerts on 🐢/⚠️), a systemd service, a check of the Scarlett under ALSA,
-  wired Ethernet, and preferably a dedicated Pi for the church.
 - Code-switching — an STT model with native on-the-fly language detection instead of a fixed
   `source_language`.
