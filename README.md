@@ -95,6 +95,46 @@ once returned a third, random language on ambiguous audio. With `language_codes=
 set the church actually expects — it did not recur. `cli.py` now always passes the configured
 languages to STT as a candidate list instead of leaving detection wide open.
 
+**Field finding, 2026-09-11:** a live test fell 90s behind the speaker and stayed there, while
+every stage after recognition stayed fast (MT ~1.7s, first TTS audio ~0.6s). Replaying the same
+recording offline, recognition never lagged more than 1.6s — the line, not the pipeline. The booth
+runs on T-Mobile home internet: plenty of bandwidth (16/36 Mbit/s) but ~0.6-1.1s of latency under
+load, and the SDK's send queue is unbounded, so a stall turns into permanent delay. What changed:
+
+- Audio goes to AssemblyAI at 16 kHz (its models' native rate), 256 instead of 768 kbit/s.
+- Unsent audio older than 3s is thrown away (`MAX_SEND_BACKLOG_S`) — losing a few seconds of
+  speech beats translating the past for the rest of the service.
+- Cartesia returns 16-bit PCM instead of float32: half the download, same sound.
+- Connect timeout 10s instead of the SDK's 1s — the TLS handshake alone measured up to 2.1s.
+- `usage.csv` STT rows carry `lag=` (how far behind the speaker) and `backlog=` (unsent audio),
+  and the menu bar turns 🐢 when the lag passes `audio.max_backlog_s`.
+
+The same test showed `partial_emit` had never fired: AssemblyAI marked no word `word_is_final`
+before its turn closed, so sermon turns went out whole (up to 86 words, ~37s). Long turns are now
+closed on the server with `ForceEndpoint` once they hold `partial_min_words` and the speaker
+pauses, or reach `partial_max_words`.
+
+Later the same day, with the network out of the way, the remaining wait was the channel itself:
+Russian speech runs longer than the English, the channel was busy 75% of the time, and new
+clauses queued behind the one still playing. Also changed:
+
+- **Dynamic speed.** TTS moved to `sonic-3`, whose numeric `generation_config.speed` measurably
+  shortens the cloned voice without shifting pitch. Speed is picked per segment between
+  `tts.speed_min` and `tts.speed_max` (1.0-1.3) from the preacher's pace (`pace_normal_wps` /
+  `pace_fast_wps`, from AssemblyAI word timings) and from audio already queued in the channel,
+  moving at most 0.1 per segment. STT rows log `wps=`, TTS rows `speed=`.
+- **Continuous intonation.** Clauses go into one Cartesia WebSocket context in turn
+  (`tts.continuous_context`), so the voice carries the intonation on instead of reading every
+  clause as a finished sentence; preferred by ear on an A/B, same ~0.2s to first audio. A new
+  context starts on a speed change or after a 4s pause; the socket is reopened after 20s idle,
+  and a failed clause falls back to one request per clause.
+- **No more assistant replies.** On short clauses ("listen", "give me wisdom") Claude sometimes
+  answered the booth in English ("I'm ready to interpret…") and it went out in the cloned voice.
+  The clause is now fenced in `<utterance>` tags with an explicit "never addressed to you", and a
+  reply that is mostly Latin letters for a Cyrillic target is dropped (14/60 bad on the old prompt,
+  0/174 on the new one). A clause cut mid-sentence ends with a comma, not a full stop, so the voice
+  does not drop its pitch in the middle of a sentence.
+
 If any provider SDK changes in the future, the contract used by `pipeline.py`
 (`STTProvider` / `MTProvider` / `TTSProvider` in `providers/base.py`) doesn't need to move — only
 the code inside that one provider file does.
@@ -187,8 +227,8 @@ Note that the app rewrites `config.yaml`, so the comments from `config.church.ex
 disappear after the first click. That's a deliberate trade-off: once channels are configured from
 the app, reading the raw YAML stops being necessary.
 
-> The menu bar labels and `OPERATOR_GUIDE.md` are intentionally in Russian — they are the
-> interface for the volunteer running the booth during a service, not developer-facing text.
+> The menu bar labels are in English; `OPERATOR_GUIDE.md` stays in Russian — it is written for
+> the volunteer running the booth during a service and quotes the English labels as they appear.
 
 ## Recording a voice sample for cloning
 
@@ -206,8 +246,27 @@ speaks Russian and Ukrainian without complaint).
 
 ## What's next
 
-- Swap `mode: mock` for `mode: real` with live keys (Milestone 2).
-- Add code-switching — an STT model with native on-the-fly language detection instead of a fixed
+Ideas measured or discussed during the 2026-09-11 tests and deliberately left for later:
+
+- **Shorter clauses on unbroken speech.** When the preacher talks without pauses, every turn is
+  closed by the word limit, not by a pause: 150-170 characters, ~11s of speech before translation
+  can start. `stt.partial_max_words` 25 -> 15 and `stt.partial_gap_ms` 250 -> 200 would roughly
+  halve that, at the cost of less context per translation. Left at 25 for now.
+- **A better clone.** Today's clone is 8 seconds of English. 20-30 seconds of clean, expressive
+  speech should sound better; a Russian-language sample (if the pastor speaks Russian) would give
+  native Russian intonation instead of English prosody carried over.
+- **Tighter translation.** Russian came out at 93-105% of the English length on short clauses, and
+  the channel was busy 57-77% of the time. A more compressed interpretation buys headroom.
+- **Wired network for the booth.** The T-Mobile line has bandwidth to spare but 0.6-1.1s of latency
+  under load; Ethernet (or a separate line) removes the one failure that produced a 90s lag.
+- **Log the text, not just its length.** `usage.csv` records character counts only, so a dropped or
+  odd translation can be read only in the terminal of that session. Logging source and translation
+  per segment (and `[mt] dropped …` events) would make every test reviewable afterwards.
+- **Calibrate the pace thresholds on a full service.** `pace_normal_wps`/`pace_fast_wps` (2.0/2.8)
+  come from ~2 minutes of one preacher.
+- **Run on a Raspberry Pi with Telegram control.** Same quality and latency (all heavy work is in
+  the cloud); needs `rumps` made macOS-only in `pyproject.toml`, a Telegram bot in place of the menu
+  bar (start/stop/status, alerts on 🐢/⚠️), a systemd service, a check of the Scarlett under ALSA,
+  wired Ethernet, and preferably a dedicated Pi for the church.
+- Code-switching — an STT model with native on-the-fly language detection instead of a fixed
   `source_language`.
-- Speaker voice cloning as its own phase; it requires consent and a disclaimer to listeners before
-  it goes anywhere near production.

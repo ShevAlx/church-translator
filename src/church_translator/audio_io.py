@@ -67,7 +67,7 @@ class ChannelRecorder:
 
 
 def list_devices() -> str:
-    """Human-readable device list, for picking `audio.device` / channel indices in config.yaml."""
+    """Human-readable device list, for picking `audio.input_device` / `audio.output_device` / channel indices in config.yaml."""
     lines = []
     for idx, dev in enumerate(sd.query_devices()):
         lines.append(
@@ -230,6 +230,12 @@ class AudioRouter:
             self._out_buffers[channel].append(
                 (uid, samples.astype(np.float32, copy=False), source_time if source_time is not None else 0.0)
             )
+
+    def queued_seconds(self, channel: int) -> float:
+        """Synthesized audio already waiting to play on `channel` — how long the
+        next sentence would sit in the queue before the listener hears it."""
+        with self._out_lock:
+            return sum(len(chunk) for _, chunk, _ in self._out_buffers[channel]) / self.samplerate
 
     # -- PortAudio callback (real-time thread — must not block) -------------
 

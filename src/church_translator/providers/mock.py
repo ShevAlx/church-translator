@@ -59,8 +59,10 @@ class MockTTS(TTSProvider):
         # channel. Left as a fallback for direct construction in tests.
         self.base_hz = base_hz
 
-    def synthesize(self, text: str, voice_id: str, language_code: str) -> np.ndarray:
-        base_hz = self.base_hz
+    def synthesize(
+        self, text: str, voice_id: str, language_code: str, speed: float | None = None
+    ) -> np.ndarray:
+        base_hz = self.base_hz  # speed ignored: a routing beep has no pace to change
         if base_hz is None:
             base_hz = 220.0 + (zlib.crc32(language_code.encode()) % 5) * 110.0
         t = np.linspace(0, self.duration_s, int(self.samplerate * self.duration_s), endpoint=False)

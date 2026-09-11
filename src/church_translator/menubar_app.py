@@ -21,10 +21,9 @@ from pathlib import Path
 
 import rumps
 import sounddevice as sd
-import yaml
 
 from .audio_io import AudioRouter, resolve_device
-from .config import AppConfig, LanguageConfig, load_config
+from .config import AppConfig, LanguageConfig, load_config, save_config
 from .pipeline import Pipeline
 from .providers.mock import MockMT, MockSTT, MockTTS
 from .usage_log import UsageLogger, date_folder
@@ -34,55 +33,7 @@ DEFAULT_TEMPLATE_PATH = Path("config.church.example.yaml")
 
 
 def _save_config(config: AppConfig, path: Path = CONFIG_PATH) -> None:
-    """Round-trips through plain PyYAML — this rewrites the file without the
-    hand-written comments in config.church.example.yaml. That's a deliberate
-    trade: once you're managing channels from the app, you don't need the
-    inline YAML notes any more. The file stays human-readable either way."""
-    data = {
-        "audio": {
-            "input_device": config.audio.input_device,
-            "output_device": config.audio.output_device,
-            "samplerate": config.audio.samplerate,
-            "blocksize": config.audio.blocksize,
-            "input_channel": config.audio.input_channel,
-            "max_backlog_s": config.audio.max_backlog_s,
-            "catchup_start_s": config.audio.catchup_start_s,
-            "max_playback_rate": config.audio.max_playback_rate,
-        },
-        "source_languages": config.source_languages,
-        "languages": [
-            {"name": lang.name, "code": lang.code, "output_channel": lang.output_channel, "voice_id": lang.voice_id}
-            for lang in config.languages
-        ],
-        "pipeline": {
-            "mode": config.pipeline.mode,
-            "stt_provider": config.pipeline.stt_provider,
-            "mt_provider": config.pipeline.mt_provider,
-            "tts_provider": config.pipeline.tts_provider,
-        },
-        # Round-tripped, not defaulted: this function rewrites the whole file, so
-        # anything missing here is silently erased from the operator's config the
-        # first time they touch a menu.
-        "stt": {
-            "end_of_turn_confidence_threshold": config.stt.end_of_turn_confidence_threshold,
-            "min_turn_silence_ms": (
-                config.stt.min_turn_silence_ms
-            ),
-            "max_turn_silence_ms": config.stt.max_turn_silence_ms,
-            "partial_emit": config.stt.partial_emit,
-            "partial_min_words": config.stt.partial_min_words,
-            "partial_max_words": config.stt.partial_max_words,
-            "partial_gap_ms": config.stt.partial_gap_ms,
-        },
-        "tts": {"speed": config.tts.speed},
-        "logging": {
-            "usage_log_path": config.logging.usage_log_path,
-            "debug_audio_dir": config.logging.debug_audio_dir,
-            "recordings_dir": config.logging.recordings_dir,
-        },
-    }
-    header = "# Managed by the church-translator menu-bar app — edits here get overwritten.\n"
-    path.write_text(header + yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    save_config(config, path)
 
 
 def _load_or_seed_config() -> AppConfig:
@@ -111,10 +62,10 @@ class ChurchTranslatorApp(rumps.App):
         self.session_start: float | None = None
         self._warned_stt = False
 
-        self.status_item = rumps.MenuItem("○ Остановлено")
-        self.toggle_item = rumps.MenuItem("▶️ Запустить перевод", callback=self.toggle_run)
+        self.status_item = rumps.MenuItem("○ Stopped")
+        self.toggle_item = rumps.MenuItem("▶️ Start translation", callback=self.toggle_run)
         self.mode_item = rumps.MenuItem(
-            f"Тестовый режим (mock), сейчас: {'вкл' if self.config.pipeline.mode == 'mock' else 'выкл'}",
+            f"Test mode (mock): {'on' if self.config.pipeline.mode == 'mock' else 'off'}",
             callback=self.toggle_mode,
         )
         self.mode_item.state = self.config.pipeline.mode == "mock"
@@ -131,20 +82,20 @@ class ChurchTranslatorApp(rumps.App):
             self.toggle_item,
             self.mode_item,
             None,
-            rumps.MenuItem("Входное устройство", callback=None),
+            rumps.MenuItem("Input device", callback=None),
             *self._device_items(kind="input"),
             None,
-            rumps.MenuItem("Выходное устройство", callback=None),
+            rumps.MenuItem("Output device", callback=None),
             *self._device_items(kind="output"),
             None,
             self._input_channel_menu(),
             self._languages_menu(),
             None,
-            rumps.MenuItem("Открыть логи", callback=self.open_logs),
-            rumps.MenuItem("Открыть debug-аудио", callback=self.open_debug_audio),
-            rumps.MenuItem("Открыть записи служб", callback=self.open_recordings),
+            rumps.MenuItem("Open logs", callback=self.open_logs),
+            rumps.MenuItem("Open debug audio", callback=self.open_debug_audio),
+            rumps.MenuItem("Open service recordings", callback=self.open_recordings),
             None,
-            rumps.MenuItem("Выход", callback=self.quit_app),
+            rumps.MenuItem("Quit", callback=self.quit_app),
         ]
 
     def _device_items(self, kind: str) -> list[rumps.MenuItem]:
@@ -161,22 +112,22 @@ class ChurchTranslatorApp(rumps.App):
         return items
 
     def _input_channel_menu(self) -> rumps.MenuItem:
-        parent = rumps.MenuItem("Входной канал")
+        parent = rumps.MenuItem("Input channel")
         n_channels = self._channel_count("input", self.config.audio.input_device) or 8
         for ch in range(n_channels):
-            item = rumps.MenuItem(f"Канал {ch}", callback=lambda sender, c=ch: self._set_input_channel(c))
+            item = rumps.MenuItem(f"Channel {ch}", callback=lambda sender, c=ch: self._set_input_channel(c))
             item.state = ch == self.config.audio.input_channel
             parent.add(item)
         return parent
 
     def _languages_menu(self) -> rumps.MenuItem:
-        parent = rumps.MenuItem("Каналы языков")
+        parent = rumps.MenuItem("Language channels")
         n_channels = self._channel_count("output", self.config.audio.output_device) or 8
         for lang in self.config.languages:
             lang_item = rumps.MenuItem(f"{lang.name} ({lang.code})")
             for ch in range(n_channels):
                 item = rumps.MenuItem(
-                    f"Канал {ch}", callback=lambda sender, c=ch, code=lang.code: self._set_output_channel(code, c)
+                    f"Channel {ch}", callback=lambda sender, c=ch, code=lang.code: self._set_output_channel(code, c)
                 )
                 item.state = ch == lang.output_channel
                 lang_item.add(item)
@@ -201,7 +152,7 @@ class ChurchTranslatorApp(rumps.App):
             self.config.audio.output_device = name
         _save_config(self.config)
         self._build_menu()
-        rumps.notification("church-translator", "Устройство изменено", name)
+        rumps.notification("church-translator", "Device changed", name)
 
     def _set_input_channel(self, channel: int) -> None:
         self.config.audio.input_channel = channel
@@ -221,11 +172,11 @@ class ChurchTranslatorApp(rumps.App):
 
     def toggle_mode(self, sender) -> None:
         if self.running:
-            rumps.alert("Сначала остановите перевод, потом меняйте режим.")
+            rumps.alert("Stop translation first, then change the mode.")
             return
         self.config.pipeline.mode = "real" if self.config.pipeline.mode == "mock" else "mock"
         sender.state = self.config.pipeline.mode == "mock"
-        sender.title = f"Тестовый режим (mock), сейчас: {'вкл' if self.config.pipeline.mode == 'mock' else 'выкл'}"
+        sender.title = f"Test mode (mock): {'on' if self.config.pipeline.mode == 'mock' else 'off'}"
         _save_config(self.config)
 
     # -- start/stop ------------------------------------------------------------
@@ -295,7 +246,10 @@ class ChurchTranslatorApp(rumps.App):
                 )
                 mt_by_lang = {lang.code: ClaudeMT() for lang in self.config.languages}
                 tts_by_lang = {
-                    lang.code: CartesiaTTS(samplerate=self.config.audio.samplerate, speed=self.config.tts.speed)
+                    lang.code: CartesiaTTS(
+                        samplerate=self.config.audio.samplerate, model=self.config.tts.model, speed=self.config.tts.speed,
+                        continuous=self.config.tts.continuous_context,
+                    )
                     for lang in self.config.languages
                 }
 
@@ -309,13 +263,13 @@ class ChurchTranslatorApp(rumps.App):
             self.session_start = time.monotonic()
             self._warned_stt = False
 
-            self.toggle_item.title = "⏹ Остановить перевод"
+            self.toggle_item.title = "⏹ Stop translation"
             self.title = "🔴"
             self._tick(None)
         except Exception as exc:  # noqa: BLE001 — surface to the operator, don't just crash the menu bar
             self.router = None
             self.pipeline = None
-            rumps.alert(f"Не удалось запустить: {exc}")
+            rumps.alert(f"Could not start: {exc}")
 
     def _stop(self) -> None:
         if self.pipeline:
@@ -329,18 +283,18 @@ class ChurchTranslatorApp(rumps.App):
         self.pipeline = None
         self.router = None
         self.session_start = None
-        self.toggle_item.title = "▶️ Запустить перевод"
+        self.toggle_item.title = "▶️ Start translation"
         self.title = "🎙️"
-        self.status_item.title = "○ Остановлено"
+        self.status_item.title = "○ Stopped"
         if any(dropped.values()):
             # Shown because it is the one number that says whether listeners
             # actually heard the service or a skipped version of it.
             rumps.notification(
-                "church-translator", "Остановлено",
-                f"Пропущено реплик (отставание): {dropped}. Много — увеличьте max_backlog_s.",
+                "church-translator", "Stopped",
+                f"Turns skipped (lag): {dropped}. If that is many, raise max_backlog_s.",
             )
         elif any(underruns.values()):
-            rumps.notification("church-translator", "Остановлено", f"Underruns по каналам: {underruns}")
+            rumps.notification("church-translator", "Stopped", f"Underruns per channel: {underruns}")
 
     def _tick(self, _sender) -> None:
         if self.session_start is None:
@@ -350,20 +304,28 @@ class ChurchTranslatorApp(rumps.App):
 
         # A dead STT stream leaves everything else looking healthy — audio still
         # flows, every thread is still alive, the timer still counts up. Without
-        # this the booth sees "● Работает" while the headphones are silent
+        # this the booth sees "● Running" while the headphones are silent
         # (happened for real during the 2026-08-23 pre-service check).
         error = self.pipeline.stt_error if self.pipeline is not None else None
         if error:
             self.title = "⚠️"
-            self.status_item.title = f"⚠️ Распознавание отвалилось — {clock}"
+            self.status_item.title = f"⚠️ Recognition lost — {clock}"
             if not self._warned_stt:
                 self._warned_stt = True
                 rumps.notification(
-                    "church-translator", "Нет связи с распознаванием",
-                    f"{error} — остановите (⏹) и запустите заново",
+                    "church-translator", "Lost connection to recognition",
+                    f"{error} — stop (⏹) and start again",
                 )
             return
-        self.status_item.title = f"● Работает — {clock}"
+        # Past max_backlog_s the output buffer is already skipping whole turns,
+        # so this is the point where the listener is actually losing sermon.
+        lag = self.pipeline.stt_lag_s if self.pipeline is not None else None
+        if lag is not None and lag > self.config.audio.max_backlog_s:
+            self.title = "🐢"
+            self.status_item.title = f"🐢 Lagging {lag:.0f}s — slow internet — {clock}"
+            return
+        self.title = "🔴"
+        self.status_item.title = f"● Running — {clock}"
 
     # -- misc ------------------------------------------------------------------
 
@@ -376,7 +338,7 @@ class ChurchTranslatorApp(rumps.App):
             Path(d).mkdir(parents=True, exist_ok=True)
             subprocess.run(["open", d])
         else:
-            rumps.alert("logging.debug_audio_dir не задан в config.yaml")
+            rumps.alert("logging.debug_audio_dir is not set in config.yaml")
 
     def open_recordings(self, _sender) -> None:
         d = self.config.logging.recordings_dir
@@ -384,7 +346,7 @@ class ChurchTranslatorApp(rumps.App):
             Path(d).mkdir(parents=True, exist_ok=True)
             subprocess.run(["open", d])
         else:
-            rumps.alert("logging.recordings_dir не задан в config.yaml")
+            rumps.alert("logging.recordings_dir is not set in config.yaml")
 
     def quit_app(self, _sender) -> None:
         if self.running:

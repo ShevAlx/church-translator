@@ -6,7 +6,7 @@ See config.example.yaml for the shape of the file. Kept as plain dataclasses
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import yaml
@@ -82,14 +82,15 @@ class STTConfig:
     # Hard ceiling (ms) on silence before a turn is closed regardless.
     max_turn_silence_ms: int = 1000
 
-    # Send finished clauses to translation while the speaker is still talking.
-    # Without this the delay can never be shorter than the speaker's longest
-    # unbroken sentence — a 457-character turn on 2026-09-06 meant ~30s of delay
-    # no matter how fast the rest of the pipeline was. Set False to go back to
-    # translating only whole turns (better context, much worse delay).
+    # Close long turns early (ForceEndpoint) so clauses reach translation while
+    # the speaker is still talking. Without this the delay can never be shorter
+    # than the speaker's longest unbroken sentence — a 457-character turn on
+    # 2026-09-06 meant ~30s of delay no matter how fast the rest of the pipeline
+    # was. Set False to translate only turns AssemblyAI ends on its own (better
+    # context, much worse delay). See AssemblyAISTT._on_turn.
     partial_emit: bool = True
-    partial_min_words: int = 8    # never cut a fragment shorter than this
-    partial_max_words: int = 25   # speaker never pauses? cut anyway at this many
+    partial_min_words: int = 8    # never close a turn shorter than this
+    partial_max_words: int = 25   # speaker never pauses? close anyway at this many
     partial_gap_ms: int = 250     # a gap this long between words counts as a pause
 
 
@@ -97,15 +98,39 @@ class STTConfig:
 class TTSConfig:
     """Cartesia synthesis settings.
 
-    `speed` is exposed because Russian and Ukrainian render longer than the
-    English they came from (107% channel load measured 2026-08-23), so shorter
-    output would directly buy back lag. Measured 2026-09-06 on the cloned voice
-    with sonic-latest, though, "fast" did NOT shorten anything — 9.1-9.8s vs
-    8.9-9.0s for "normal" across repeats, i.e. noise. Left configurable in case
-    a future model honours it; do not count on it as a latency fix.
+    Russian and Ukrainian render longer than the English they came from, and
+    that — not the network, not MT — is what made the listener wait: on the
+    2026-09-11 test the channel was playing 75% of the time and 68% of new
+    turns arrived while the previous one was still in the headphones.
+
+    `speed` ("slow"/"normal"/"fast") is the pre-Sonic-3 knob and measured as a
+    no-op on the clone (2026-09-06, again 2026-09-11). Sonic-3 has a numeric
+    generation_config.speed instead, and it works on the cloned voice without
+    shifting its pitch — same 34 sermon phrases, 2026-09-11, mean of 2 runs:
+    sonic-latest 100%, sonic-3 at 1.0 90%, 1.2 87%, 1.3 85%, 1.4 76%.
+
+    The speed is chosen per segment (pipeline.choose_speed): faster when the
+    preacher speeds up, and faster when translation is piling up in the
+    headphones regardless of pace.
     """
 
-    speed: str = "normal"  # "slow" | "normal" | "fast"
+    model: str = "sonic-3"   # generation_config.speed only exists on sonic-3*
+    # Clauses spoken in one continuous Cartesia context, so intonation carries
+    # from one to the next instead of every clause sounding like a whole
+    # sentence (see providers/cartesia_tts.py). False = one request per clause,
+    # the pre-2026-09-11 behaviour — the switch to flip if the socket misbehaves.
+    continuous_context: bool = True
+    speed: str = "normal"    # legacy knob, used only by pre-sonic-3 models
+    speed_min: float = 1.0   # normal pace, nothing queued
+    speed_max: float = 1.3   # ceiling; Cartesia accepts 0.6-1.5. 1.4 was audibly rushed on the clone (2026-09-11)
+    # Preacher's pace in words/s (from AssemblyAI word timings, smoothed).
+    # At or below pace_normal_wps the voice runs at speed_min; at pace_fast_wps
+    # and above, at speed_max; linear in between.
+    # Calibrated on the 2026-09-11 test: this preacher averaged 1.9 words/s and
+    # peaked at 2.6 (pauses inside a turn included), so the first guess of
+    # 2.5/3.5 never let pace move the speed at all — only the queue did.
+    pace_normal_wps: float = 2.0
+    pace_fast_wps: float = 2.8
 
 
 @dataclass
@@ -160,6 +185,13 @@ class AppConfig:
             raise ValueError(f"audio.max_playback_rate must be 1.0-1.5, got {self.audio.max_playback_rate}")
         if self.tts.speed not in ("slow", "normal", "fast"):
             raise ValueError(f"tts.speed must be slow/normal/fast, got {self.tts.speed!r}")
+        if not 0.6 <= self.tts.speed_min <= self.tts.speed_max <= 1.5:
+            raise ValueError(
+                f"need 0.6 <= tts.speed_min <= tts.speed_max <= 1.5 (Cartesia's range), "
+                f"got {self.tts.speed_min}-{self.tts.speed_max}"
+            )
+        if not 0 < self.tts.pace_normal_wps < self.tts.pace_fast_wps:
+            raise ValueError("need 0 < tts.pace_normal_wps < tts.pace_fast_wps")
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -179,3 +211,21 @@ def load_config(path: str | Path) -> AppConfig:
     )
     cfg.validate()
     return cfg
+
+
+def save_config(config: AppConfig, path: str | Path) -> None:
+    """Rewrite the whole file from `config`, every section included.
+
+    Built from the dataclasses themselves rather than a hand-listed dict: both
+    writers of config.yaml (menubar app, `clone-voice --assign`) used to list
+    fields by hand, and clone-voice's list had no `stt`/`tts`, so cloning a
+    voice silently reset the endpointing tuning to defaults. A field added to
+    any dataclass above now round-trips without touching this function.
+
+    Plain PyYAML, so hand-written comments from config.church.example.yaml do
+    not survive — a deliberate trade once the file is managed by the app.
+    """
+    header = "# Managed by the church-translator menu-bar app — edits here get overwritten.\n"
+    Path(path).write_text(
+        header + yaml.safe_dump(asdict(config), allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )

@@ -10,10 +10,9 @@ import time
 from pathlib import Path
 
 import sounddevice as sd
-import yaml
 
 from .audio_io import AudioRouter, list_devices, resolve_device
-from .config import load_config
+from .config import load_config, save_config
 from .pipeline import Pipeline, _write_debug_wav
 from .providers.mock import MockMT, MockSTT, MockTTS
 from .usage_log import UsageLogger, date_folder
@@ -30,7 +29,8 @@ def _cmd_list_devices(_args: argparse.Namespace) -> None:
     print(list_devices())
     print(
         "\nPick the interface your mixer feed is plugged into, then set its name\n"
-        "(or a distinctive substring) as `audio.device` in your config.yaml."
+        "(or a distinctive substring) as `audio.input_device` / `audio.output_device`\n"
+        "in your config.yaml — the same name in both is fine for a duplex interface."
     )
 
 
@@ -81,7 +81,10 @@ def _build_real_pipeline(config, router, usage_logger, session_id) -> Pipeline:
     )
     mt_by_lang = {lang.code: ClaudeMT() for lang in config.languages}
     tts_by_lang = {
-        lang.code: CartesiaTTS(samplerate=config.audio.samplerate, speed=config.tts.speed)
+        lang.code: CartesiaTTS(
+            samplerate=config.audio.samplerate, model=config.tts.model, speed=config.tts.speed,
+            continuous=config.tts.continuous_context,
+        )
         for lang in config.languages
     }
     return Pipeline(
@@ -153,7 +156,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         if any(dropped.values()):
             # The operator's tuning signal: anything above the odd one or two
             # means max_backlog_s is too tight for how fast the voice speaks.
-            print(f"[audio] пропущено целых реплик по каналам (отставание > {config.audio.max_backlog_s:.0f}с): {dropped}")
+            print(f"[audio] whole turns skipped per channel (lag > {config.audio.max_backlog_s:.0f}s): {dropped}")
         print("Stopped.")
 
 
@@ -166,7 +169,7 @@ def _cmd_record_sample(args: argparse.Namespace) -> None:
     samplerate = config.audio.samplerate
     channel = config.audio.input_channel
 
-    print(f"Recording {args.seconds}s from channel {channel} in 2s... говорите чисто, без музыки за спиной.")
+    print(f"Recording {args.seconds}s from channel {channel} in 2s... speak clearly, no music in the background.")
     time.sleep(2)
     frames = int(samplerate * args.seconds)
     recording = sd.rec(
@@ -178,8 +181,8 @@ def _cmd_record_sample(args: argparse.Namespace) -> None:
     out_path = Path(args.out)
     _write_debug_wav(out_path, mono, samplerate)
     peak = float(abs(mono).max()) if len(mono) else 0.0
-    print(f"Saved {out_path} ({args.seconds}s, peak={peak:.3f}). Прослушайте перед клонированием — "
-          f"{'сигнал есть' if peak > 0.02 else 'ПОДОЗРИТЕЛЬНО ТИХО, проверьте вход'}.")
+    print(f"Saved {out_path} ({args.seconds}s, peak={peak:.3f}). Listen to it before cloning — "
+          f"{'signal present' if peak > 0.02 else 'SUSPICIOUSLY QUIET, check the input'}.")
 
 
 def _cmd_clone_voice(args: argparse.Namespace) -> None:
@@ -210,17 +213,7 @@ def _cmd_clone_voice(args: argparse.Namespace) -> None:
             return
         for lang in matched:
             lang.voice_id = voice.id
-        with config_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(
-                {
-                    "audio": vars(config.audio),
-                    "source_languages": config.source_languages,
-                    "languages": [vars(lang) for lang in config.languages],
-                    "pipeline": vars(config.pipeline),
-                    "logging": vars(config.logging),
-                },
-                f, allow_unicode=True, sort_keys=False,
-            )
+        save_config(config, config_path)
         print(f"Assigned {voice.id} to: {', '.join(l.code for l in matched)} in {config_path}")
 
 
@@ -278,10 +271,10 @@ def _cmd_replay(args: argparse.Namespace) -> None:
               f"({100 * info['voiced_s'] / src_s:.0f}% channel load)")
     dropped = router.dropped_report()
     if any(dropped.values()):
-        print(f"  пропущено целых реплик: {dropped}")
+        print(f"  whole turns skipped: {dropped}")
     underruns = router.underrun_report()
-    print(f"  underruns (тишина в паузах — норма): {underruns}")
-    print("\nПослушайте файлы выше — это ровно то, что услышал бы слушатель.")
+    print(f"  underruns (silence in pauses is normal): {underruns}")
+    print("\nListen to the files above — exactly what a listener would have heard.")
 
 
 def main(argv: list[str] | None = None) -> None:

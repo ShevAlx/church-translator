@@ -1,58 +1,57 @@
-# Конфигурация под ваше реальное железо и стартовый сценарий:
+# Configuration for the real hardware and the starting scenario:
 #   Behringer X32 (copy of Main L/R) --USB--> Focusrite Scarlett 2i2 --jack-->
-#   Left output -> передатчик 1 (ru) · Right output -> передатчик 2 (uk)
+#   Left output -> transmitter 1 (ru) · Right output -> transmitter 2 (uk)
 #
-# Источник — английский. Цели — русский и украинский. Это не одно и то же:
-# source_languages ниже говорит STT, что распознавать (только то, что
-# реально звучит в микрофоне); languages ниже — это то, что MT/TTS
-# производят на выходе. Раньше в коде эти два списка были одним и тем же —
-# для en->ru/uk так не работает: AssemblyAI live-тестом 19.08.2026 отверг
-# "uk" как источник (украинского нет в их списке распознаваемых языков),
-# хотя украинский на выходе (Cartesia TTS) работает нормально.
+# The source is English; the targets are Russian and Ukrainian. These are not
+# the same thing: source_languages below tells STT what to recognize (only what
+# actually comes through the microphone); languages below is what MT/TTS
+# produce on the output side. The code used to treat the two lists as one —
+# that breaks for en->ru/uk: in a live test on 2026-08-19 AssemblyAI rejected
+# "uk" as a source (Ukrainian is not in its list of recognizable languages),
+# even though Ukrainian output (Cartesia TTS) works fine.
 #
-# Копируйте в config.yaml, когда интерфейс физически подключён к этому Mac.
-# Перед первым запуском обязательно сверьтесь с `list-devices`.
+# Copy to config.yaml once the interface is physically connected to this Mac.
+# Always check against `list-devices` before the first run.
 
 audio:
   input_device: "Scarlett 2i2"
   output_device: "Scarlett 2i2"
   samplerate: 48000
   blocksize: 512
-  input_channel: 0   # канал L со входа "copy of Main L/R" с X32
+  input_channel: 0   # L channel of the "copy of Main L/R" feed from the X32
 
 source_languages:
-  - en   # только то, что реально ожидается от спикера — не ru/uk
+  - en   # only what the speaker is actually expected to say — not ru/uk
 
 languages:
   - name: russian
     code: ru
-    output_channel: 0   # -> Left output -> передатчик 1
-    voice_id: "1e4176b1-3db9-44d6-a601-4fe68b041942"   # Cartesia: Sergei (native ru), live-проверен
+    output_channel: 0   # -> Left output -> transmitter 1
+    voice_id: "1e4176b1-3db9-44d6-a601-4fe68b041942"   # Cartesia: Sergei (native ru), verified live
   - name: ukrainian
     code: uk
-    output_channel: 1   # -> Right output -> передатчик 2
-    voice_id: "05ffab9c-d380-4909-8375-cd12f59238c3"   # Cartesia: Oleh (native uk) — пока единственный uk-голос в каталоге
+    output_channel: 1   # -> Right output -> transmitter 2
+    voice_id: "05ffab9c-d380-4909-8375-cd12f59238c3"   # Cartesia: Oleh (native uk) — so far the only uk voice in the catalog
 
 pipeline:
-  mode: mock   # переключить на real, когда будете тестировать живым звуком
+  mode: mock   # switch to real when testing with live audio
   stt_provider: assemblyai
   mt_provider: claude
   tts_provider: cartesia
 
 logging:
   usage_log_path: "./logs/usage.csv"
-  recordings_dir: "./logs/recordings"   # один непрерывный wav на язык за сессию, в подпапке по дате
+  recordings_dir: "./logs/recordings"   # one continuous wav per language per session, in a per-date subfolder
 
-# --- Ограничения именно этой связки ---
+# --- Limits of this particular setup ---
 #
-# 1. Потолок — 2 языка (2 выхода у Scarlett 2i2). Третий язык — либо
-#    Aggregate Device из двух интерфейсов, либо карта побольше.
+# 1. Ceiling of 2 languages (the Scarlett 2i2 has 2 outputs). A third language
+#    needs either an Aggregate Device built from two interfaces or a bigger one.
 #
-# 2. Вход — "copy of Main L/R" с X32, то есть весь микс, а не изолированный
-#    микрофон спикера. Для точности STT в перспективе лучше развести
-#    отдельную AUX-шину только с речью.
+# 2. The input is "copy of Main L/R" from the X32 — the whole mix, not an
+#    isolated speaker mic. For STT accuracy a dedicated AUX bus carrying only
+#    speech is the better long-term setup.
 #
-# 3. Голос на украинский канал — только один вариант в каталоге Cartesia
-#    (Oleh, мужской). Если нужен выбор голоса/пола — стоит проверить
-#    каталог заново позже или рассмотреть ElevenLabs как альтернативу для
-#    именно этого языка.
+# 3. Only one voice for the Ukrainian channel in the Cartesia catalog (Oleh,
+#    male). If a choice of voice/gender is needed, re-check the catalog later
+#    or consider ElevenLabs as an alternative for this language specifically.

@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from .audio_io import AudioRouter
-from .config import AppConfig, LanguageConfig
+from .config import AppConfig, LanguageConfig, TTSConfig
 from .providers.base import MTProvider, STTProvider, TranscriptEvent, TTSProvider
 from .usage_log import UsageLogger, date_folder
 
@@ -141,6 +141,19 @@ def _write_debug_wav(path: Path, samples: np.ndarray, samplerate: int) -> None:
         f.writeframes(pcm16.tobytes())
 
 
+def _stt_note(event: TranscriptEvent) -> str:
+    """usage.csv note for an STT row: how far behind the speaker recognition is
+    running. Empty for providers that do not report it (the mock)."""
+    parts = []
+    if event.stt_lag_s is not None:
+        parts.append(f"lag={event.stt_lag_s:.1f}s")
+    if event.stt_backlog_s is not None:
+        parts.append(f"backlog={event.stt_backlog_s:.1f}s")
+    if event.words_per_s is not None:
+        parts.append(f"wps={event.words_per_s:.2f}")
+    return " ".join(parts)
+
+
 class _STTStage(threading.Thread):
     """Runs once per service, regardless of language count (report §05 fan-out point)."""
 
@@ -173,7 +186,7 @@ class _STTStage(threading.Thread):
                 continue
             self._usage_logger.log(
                 self._session_id, event.language_code, "stt",
-                duration_s=time.monotonic() - t0, chars=len(event.text),
+                duration_s=time.monotonic() - t0, chars=len(event.text), note=_stt_note(event),
             )
             for q in self._fanout:
                 # Never block here. This thread is also the one feeding audio to
@@ -190,6 +203,44 @@ class _STTStage(threading.Thread):
                         pass
 
 
+# Translation piling up in the headphones pushes the voice faster whatever the
+# preacher's pace: ~3s queued is where the wait starts to be noticeable, and by
+# ~8s the output buffer is close to skipping whole turns (audio.max_backlog_s).
+QUEUE_BOOST_START_S = 3.0
+QUEUE_BOOST_FULL_S = 8.0
+PACE_SMOOTHING = 0.3  # weight of the newest turn in the running pace estimate
+# Largest speed change from one segment to the next. A jump from 1.0 straight to
+# 1.3 between two clauses of one sentence was audible on the 2026-09-11 test;
+# 0.1 per segment still reaches the ceiling within three clauses.
+MAX_SPEED_STEP = 0.1
+
+
+def choose_speed(
+    tts: "TTSConfig", pace_wps: float | None, queued_s: float, previous: float | None = None
+) -> float:
+    """Synthesis speed for the next segment, in [tts.speed_min, tts.speed_max].
+
+    Two pressures, and the stronger one wins. A preacher speeding up means more
+    words per second to render, so the voice has to keep pace or fall behind;
+    audio already waiting in the channel means it is falling behind right now.
+    The speed is fixed within a segment and moves between segments, at most
+    MAX_SPEED_STEP from `previous` — a change mid-sentence is audible, and so
+    is a big one between two clauses of the same sentence.
+    """
+    pace = 0.0
+    if pace_wps is not None:
+        pace = (pace_wps - tts.pace_normal_wps) / (tts.pace_fast_wps - tts.pace_normal_wps)
+    queue = (queued_s - QUEUE_BOOST_START_S) / (QUEUE_BOOST_FULL_S - QUEUE_BOOST_START_S)
+    pressure = min(1.0, max(0.0, pace, queue))
+    target = tts.speed_min + pressure * (tts.speed_max - tts.speed_min)
+    if previous is not None:
+        target = min(max(target, previous - MAX_SPEED_STEP), previous + MAX_SPEED_STEP)
+    # On a 0.1 grid: Cartesia fixes the speed per continuous context, so every
+    # distinct value starts a new one and breaks the intonation — 1.16 then
+    # 1.19 would cost a context for no audible gain.
+    return round(target, 1)
+
+
 class _LanguageStage(threading.Thread):
     """One per configured language: MT then TTS, writing into that language's output channel."""
 
@@ -204,6 +255,7 @@ class _LanguageStage(threading.Thread):
         session_id: str,
         stop_event: threading.Event,
         debug_audio_dir: str | None = None,
+        tts_config: "TTSConfig | None" = None,
     ):
         super().__init__(name=f"lang-{lang.code}", daemon=True)
         self._lang = lang
@@ -216,6 +268,9 @@ class _LanguageStage(threading.Thread):
         self._stop_event = stop_event
         self._debug_audio_dir = Path(debug_audio_dir) / date_folder(session_id) if debug_audio_dir else None
         self._debug_counter = 0
+        self._tts_config = tts_config  # None = natural speed, no pace tracking
+        self._pace_wps: float | None = None  # preacher's pace, smoothed over turns
+        self._last_speed: float | None = None  # previous segment's speed, for MAX_SPEED_STEP
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -223,6 +278,13 @@ class _LanguageStage(threading.Thread):
                 event = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if event.words_per_s is not None:
+                # Smoothed so one hurried phrase does not jerk the voice faster
+                # for the sentence after it; a sustained change still gets
+                # through within three or four turns.
+                self._pace_wps = event.words_per_s if self._pace_wps is None else (
+                    PACE_SMOOTHING * event.words_per_s + (1 - PACE_SMOOTHING) * self._pace_wps
+                )
             # One id for the whole turn, shared by every sentence it was split
             # into. Splitting exists so the first sentence can start playing
             # while the rest is still translating — but the turn is the unit of
@@ -257,7 +319,12 @@ class _LanguageStage(threading.Thread):
             t0 = time.monotonic()
             first_audio_s: float | None = None
             chunks: list[np.ndarray] = []
-            stream = self._tts.synthesize_stream(translated, self._lang.voice_id, self._lang.code)
+            speed = None
+            if self._tts_config is not None:
+                queued = self._router.queued_seconds(self._lang.output_channel)
+                speed = choose_speed(self._tts_config, self._pace_wps, queued, previous=self._last_speed)
+                self._last_speed = speed
+            stream = self._tts.synthesize_stream(translated, self._lang.voice_id, self._lang.code, speed=speed)
             for chunk in trim_silence_stream(stream):
                 if not len(chunk):
                     continue
@@ -268,10 +335,12 @@ class _LanguageStage(threading.Thread):
                 )
                 if self._debug_audio_dir is not None:
                     chunks.append(chunk)
+            note = f"first_audio={first_audio_s:.2f}s" if first_audio_s is not None else "no audio"
+            if speed is not None:
+                note += f" speed={speed:.2f}"
             self._usage_logger.log(
                 self._session_id, self._lang.code, "tts",
-                duration_s=time.monotonic() - t0, chars=len(translated),
-                note=f"first_audio={first_audio_s:.2f}s" if first_audio_s is not None else "no audio",
+                duration_s=time.monotonic() - t0, chars=len(translated), note=note,
             )
 
             if self._debug_audio_dir is not None and chunks:
@@ -328,6 +397,7 @@ class Pipeline:
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._stt = stt
+        self._tts_providers = list((tts_by_language or {}).values())  # closed in stop()
 
         if config.pipeline.mode == "passthrough":
             self._threads.append(_PassthroughStage(router, config.languages, self._stop_event))
@@ -347,7 +417,7 @@ class Pipeline:
             self._threads.append(
                 _LanguageStage(
                     lang, q, mt, tts, router, usage_logger, self._session_id, self._stop_event,
-                    debug_audio_dir=debug_audio_dir,
+                    debug_audio_dir=debug_audio_dir, tts_config=config.tts,
                 )
             )
 
@@ -365,6 +435,15 @@ class Pipeline:
         Providers without the attribute (the mock) simply never report an error.
         """
         return getattr(self._stt, "fatal_error", None)
+
+    @property
+    def stt_lag_s(self) -> float | None:
+        """How far recognition is running behind the speaker, as of the last
+        transcript. A slow line does not break anything visibly — translation
+        keeps coming, just of what was said a minute ago (2026-09-11: 90s,
+        found only by aligning recordings afterwards). None until the first
+        transcript, and for providers that do not measure it (the mock)."""
+        return getattr(self._stt, "last_lag_s", None)
 
     def start(self) -> None:
         for t in self._threads:
@@ -387,3 +466,10 @@ class Pipeline:
                 self._stt.close()
             except Exception as exc:  # noqa: BLE001 — shutdown must never raise
                 print(f"[pipeline] STT close failed (the connection drops anyway): {exc}")
+        # Continuous-context TTS holds a WebSocket per language; without this
+        # every ⏹/▶️ in the menu bar would leave another one open.
+        for tts in self._tts_providers:
+            try:
+                tts.close()
+            except Exception as exc:  # noqa: BLE001 — shutdown must never raise
+                print(f"[pipeline] TTS close failed: {exc}")
