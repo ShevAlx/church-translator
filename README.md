@@ -264,23 +264,63 @@ speaks Russian and Ukrainian without complaint).
 
 ## What's next
 
-Ideas measured or discussed during the 2026-09-11 tests and deliberately left for later:
+### Applied after the 2026-09-14 live service
 
-- **Shorter clauses on unbroken speech.** When the preacher talks without pauses, every turn is
-  closed by the word limit, not by a pause: 150-170 characters, ~11s of speech before translation
-  can start. `stt.partial_max_words` 25 -> 15 and `stt.partial_gap_ms` 250 -> 200 would roughly
-  halve that, at the cost of less context per translation. Left at 25 for now.
+The service ran 1:15:54 in "combat mode" (real audience, real risk) and surfaced problems a
+~2-minute bench test never could: delay well past `max_backlog_s` (10s) rather than the ~3s
+expected, choppy delivery even with continuous-context TTS, and enough dropped phrases (ru 19,
+uk 38 of 1403) that the congregation had no way to react when the preacher asked them to. Fixed
+from that report, without another live test to re-measure against yet — watch the next service:
+
+- **Shorter clauses on unbroken speech.** This was flagged after 2026-09-11 and deliberately left
+  at the old values; 2026-09-14 was the full-service confirmation it needed. `stt.partial_max_words`
+  25 -> 15 and `stt.partial_gap_ms` 250 -> 200 now ship as the default — a preacher who does not
+  pause was hitting the word ceiling on most turns, at ~11s of speech before translation could even
+  start; this should roughly halve that floor. Trade-off: less surrounding context per clause for
+  translation.
+- **Choppy delivery from the speed control fighting continuous context.** Root cause: Cartesia
+  fixes synthesis speed per WebSocket context, so *any* speed change — even the smallest single
+  step — ends the current context and starts a new one, losing the intonation continuous context
+  exists to carry (see `providers/cartesia_tts.py`). `choose_speed()` recomputes a target every
+  segment from how much audio is already queued, and under a full service's sustained near-100%
+  channel load that queue depth wobbles by a few seconds turn to turn — crossing the old 0.1
+  rounding grid on a large fraction of segments and forcing a reconnect almost every clause. Added
+  `SPEED_DEADBAND` (`pipeline.py`): small drift now holds the previous speed exactly; only a
+  sustained change moves it. A synthetic replay of a fluctuating queue cut context resets from 35
+  to 2 across 200 segments.
+- **Log the text, not just its length.** `usage.csv` recorded character counts only, so a dropped
+  or odd translation could be read only in the terminal of that one session — gone by the time a
+  summary like the 2026-09-14 one arrives with just aggregate counts and no way to tell which
+  phrases they were. STT and MT rows now also log the actual recognized/source/translated text
+  (capped at 200 chars/row). Next time, the report can be answered from the CSV instead of guesses.
+
+### Still open
+
+- **The uk channel drops roughly twice the phrases ru does** (38 vs 19 on 2026-09-14, out of a
+  shared segment count). Worth checking with the new text logging above: whether Ukrainian MT
+  output runs measurably longer per source clause than Russian's, which would mean it needs its
+  own, more compressed prompt or a higher `speed_max`.
+- **No feedback from the room when the preacher asked for one.** Partly the same delay this report
+  addresses, but also structural: the channel ran near 100% busy (see `TTSConfig` and
+  `config.py`'s `max_backlog_s` comments), so translated audio is *by design* usually seconds
+  behind even with nothing going wrong — `audio.max_playback_rate` (catch-up speed-up) exists for
+  this and ships off, because it shifts pitch audibly on a cloned voice. Worth a supervised test at
+  a small `max_playback_rate` (1.05-1.1) specifically to see whether that trade is worth it once the
+  fixes above have had a service to prove out.
+- **Noise in the microphone.** The input is a "copy of Main L/R" from the mixer — the whole mix
+  (music, room noise, everyone's mic), not an isolated preacher feed; `config.church.example.yaml`
+  already flags this as a setup limitation. No amount of code fixes STT accuracy against a feed
+  that was never just speech. Fix is on the mixer side: a dedicated AUX bus carrying only the
+  preacher's mic, sent to the interface's input instead of the full mix.
 - **A better clone.** Today's clone is 8 seconds of English. 20-30 seconds of clean, expressive
   speech should sound better; a Russian-language sample (if the pastor speaks Russian) would give
   native Russian intonation instead of English prosody carried over.
 - **Tighter translation.** Russian came out at 93-105% of the English length on short clauses, and
-  the channel was busy 57-77% of the time. A more compressed interpretation buys headroom.
+  the channel was busy 57-77% of the time on the 2026-09-11 sample (higher on 2026-09-14's full
+  service). A more compressed interpretation buys headroom.
 - **Wired network for the booth.** The T-Mobile line has bandwidth to spare but 0.6-1.1s of latency
   under load; Ethernet (or a separate line) removes the one failure that produced a 90s lag.
-- **Log the text, not just its length.** `usage.csv` records character counts only, so a dropped or
-  odd translation can be read only in the terminal of that session. Logging source and translation
-  per segment (and `[mt] dropped …` events) would make every test reviewable afterwards.
 - **Calibrate the pace thresholds on a full service.** `pace_normal_wps`/`pace_fast_wps` (2.0/2.8)
-  come from ~2 minutes of one preacher.
+  still come from ~2 minutes of one preacher, not the full 2026-09-14 service.
 - Code-switching — an STT model with native on-the-fly language detection instead of a fixed
   `source_language`.

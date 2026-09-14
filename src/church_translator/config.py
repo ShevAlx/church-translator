@@ -90,8 +90,19 @@ class STTConfig:
     # context, much worse delay). See AssemblyAISTT._on_turn.
     partial_emit: bool = True
     partial_min_words: int = 8    # never close a turn shorter than this
-    partial_max_words: int = 25   # speaker never pauses? close anyway at this many
-    partial_gap_ms: int = 250     # a gap this long between words counts as a pause
+    # 25/250 was measured on the 2026-09-11 sample (~2 minutes, a speaker who
+    # paused often) and left at 25 on purpose — the README's "next steps" flagged
+    # 15/200 as the fix for continuous speech but deferred it for lack of a full
+    # service to confirm against. The 2026-09-14 live service supplied that
+    # confirmation the hard way: a preacher who does not pause hits the word
+    # ceiling instead of a real pause on most turns, so this cap sets the delay
+    # directly — measured 150-170 chars/~11s of speech before translation could
+    # even start. 15/200 roughly halves that, at the cost of shorter context per
+    # clause for translation (already budgeted for — see MT's "interpret, don't
+    # transcribe" prompt in claude_mt.py, which needs less surrounding text than
+    # a literal translation would).
+    partial_max_words: int = 15   # speaker never pauses? close anyway at this many
+    partial_gap_ms: int = 200     # a gap this long between words counts as a pause
 
 
 @dataclass

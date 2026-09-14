@@ -141,9 +141,27 @@ def _write_debug_wav(path: Path, samples: np.ndarray, samplerate: int) -> None:
         f.writeframes(pcm16.tobytes())
 
 
+# usage.csv previously logged only character counts (chars=len(...)), so a
+# dropped or oddly-short turn was visible only in the terminal of that one
+# session — gone the moment the booth Pi's screen session ended. The
+# 2026-09-14 service report was a handful of aggregate numbers (dropped
+# counts, total chars) with no way to tell which phrases those were or what
+# the preacher had actually said at that point — flagged as a "next step"
+# since 2026-09-11 and applied now that a real service showed why it matters.
+# Kept short: a spreadsheet cell, not a full-text archive — long enough to
+# recognize the sentence, short enough not to bloat every row.
+_LOG_TEXT_CHARS = 200
+
+
+def _log_text(text: str) -> str:
+    text = " ".join(text.split())  # newlines/tabs collapse to spaces — one CSV cell, one line
+    return text if len(text) <= _LOG_TEXT_CHARS else text[:_LOG_TEXT_CHARS] + "…"
+
+
 def _stt_note(event: TranscriptEvent) -> str:
     """usage.csv note for an STT row: how far behind the speaker recognition is
-    running. Empty for providers that do not report it (the mock)."""
+    running, plus what was actually recognized. Lag/backlog/wps are empty for
+    providers that do not report them (the mock)."""
     parts = []
     if event.stt_lag_s is not None:
         parts.append(f"lag={event.stt_lag_s:.1f}s")
@@ -151,6 +169,8 @@ def _stt_note(event: TranscriptEvent) -> str:
         parts.append(f"backlog={event.stt_backlog_s:.1f}s")
     if event.words_per_s is not None:
         parts.append(f"wps={event.words_per_s:.2f}")
+    if event.text.strip():
+        parts.append(f'text="{_log_text(event.text)}"')
     return " ".join(parts)
 
 
@@ -213,6 +233,20 @@ PACE_SMOOTHING = 0.3  # weight of the newest turn in the running pace estimate
 # 1.3 between two clauses of one sentence was audible on the 2026-09-11 test;
 # 0.1 per segment still reaches the ceiling within three clauses.
 MAX_SPEED_STEP = 0.1
+# Below this much raw change, keep the previous speed exactly rather than step
+# toward the new target. Cartesia fixes speed per continuous context (see
+# providers/cartesia_tts.py), so *any* change — even the smallest MAX_SPEED_STEP
+# — ends the current context and starts a new one, losing the intonation that
+# continuous context exists to carry. `queued_s` moves every segment under real
+# load (whole sentences arriving and draining a few seconds at a time), so
+# without a deadband the raw target drifts back and forth across every 0.1 grid
+# line and every single clause pays for a reconnect — measured as the "фразы не
+# совсем были слитные" complaint on the 2026-09-14 service, a 75-minute test at
+# sustained near-100% channel load where the earlier short sample never ran
+# long enough to show it. A deadband bigger than MAX_SPEED_STEP means small
+# noise is absorbed at the current speed; a sustained trend still gets through
+# once it clears the band, one MAX_SPEED_STEP at a time as before.
+SPEED_DEADBAND = 0.15
 
 
 def choose_speed(
@@ -225,7 +259,9 @@ def choose_speed(
     audio already waiting in the channel means it is falling behind right now.
     The speed is fixed within a segment and moves between segments, at most
     MAX_SPEED_STEP from `previous` — a change mid-sentence is audible, and so
-    is a big one between two clauses of the same sentence.
+    is a big one between two clauses of the same sentence. Below SPEED_DEADBAND
+    of raw change, `previous` is kept exactly: every distinct value costs a
+    Cartesia context, so a small wobble in the backlog must not spend one.
     """
     pace = 0.0
     if pace_wps is not None:
@@ -234,6 +270,8 @@ def choose_speed(
     pressure = min(1.0, max(0.0, pace, queue))
     target = tts.speed_min + pressure * (tts.speed_max - tts.speed_min)
     if previous is not None:
+        if abs(target - previous) < SPEED_DEADBAND:
+            return previous
         target = min(max(target, previous - MAX_SPEED_STEP), previous + MAX_SPEED_STEP)
     # On a 0.1 grid: Cartesia fixes the speed per continuous context, so every
     # distinct value starts a new one and breaks the intonation — 1.16 then
@@ -312,6 +350,7 @@ class _LanguageStage(threading.Thread):
             self._usage_logger.log(
                 self._session_id, self._lang.code, "mt",
                 duration_s=time.monotonic() - t0, chars=len(translated),
+                note=f'in="{_log_text(text)}" out="{_log_text(translated)}"',
             )
             if not translated.strip():
                 return
