@@ -294,6 +294,40 @@ from that report, without another live test to re-measure against yet — watch 
   phrases they were. STT and MT rows now also log the actual recognized/source/translated text
   (capped at 200 chars/row). Next time, the report can be answered from the CSV instead of guesses.
 
+### Applied 2026-09-15 (looking for more delay to cut)
+
+Follow-up pass at the same report, once the fixes above were in but before another live service
+existed to re-measure against. This one is **prompt text only, unverified against real sermon
+audio** — no ANTHROPIC_API_KEY in the environment this was written in to A/B it, unlike the
+2026-09-11 measurement behind the original 91%->77% number. Check it against the next service's
+`usage.csv` (now that MT rows log both `in=` and `out=` text) before trusting the ratio moved.
+
+- **Push harder on translation length.** The channel-budget framing in `claude_mt.py`'s system
+  prompt was one adjective ("as few words as carry the full meaning") competing with several other
+  instructions for the model's attention. Rewrote it as its own explicit paragraph: the channel
+  runs close to fully booked for the whole service, so a longer rendering is *heard later*, not
+  sooner — same guardrail as before (names/numbers/scripture/commands must still survive), just
+  said as the reason rather than left implicit. This is the same lever as the 2026-09-11
+  91%->77% cut, pushed further; whether it moves the ratio again needs the next service to confirm.
+
+Deliberately **not** touched this pass, because every option left costs something real without a
+live service to weigh it against:
+- `stt.partial_min_words`/`partial_gap_ms` further down — cuts more of the pre-translation floor,
+  at a further cost to per-clause context (already moved once on 2026-09-14 evidence).
+- `audio.max_playback_rate` (catch-up) — see "Still open" below; needs ears on the actual voice in
+  use, not a guess from a config comment about a different test.
+- Pipelining MT and TTS across the sentences one turn gets split into (`_LanguageStage._handle_segment`
+  currently runs each one fully serially) — real latency on paper, but `stt.partial_max_words` 15
+  now keeps most turns under `MAX_SEGMENT_CHARS` as a single segment already, so there may be little
+  left to pipeline. Worth measuring from the new text log before spending the refactor.
+- Streaming the Claude response and pushing partial text into Cartesia's context as it arrives,
+  instead of waiting for the full translation — likely the single biggest remaining latency cut
+  (shaves the MT round-trip off time-to-first-audio, not just off total channel load), and the
+  biggest change: it turns `MTProvider.translate()` from one call into a stream `TTSProvider`
+  would need to consume incrementally, touching `base.py`, `claude_mt.py`, `cartesia_tts.py` and
+  `pipeline.py` together. Too large to land blind in one pass with no live test to catch a bad
+  interaction (a mid-word Cartesia push, a cut-off stream) before a service does.
+
 ### Still open
 
 - **The uk channel drops roughly twice the phrases ru does** (38 vs 19 on 2026-09-14, out of a
@@ -315,9 +349,6 @@ from that report, without another live test to re-measure against yet — watch 
 - **A better clone.** Today's clone is 8 seconds of English. 20-30 seconds of clean, expressive
   speech should sound better; a Russian-language sample (if the pastor speaks Russian) would give
   native Russian intonation instead of English prosody carried over.
-- **Tighter translation.** Russian came out at 93-105% of the English length on short clauses, and
-  the channel was busy 57-77% of the time on the 2026-09-11 sample (higher on 2026-09-14's full
-  service). A more compressed interpretation buys headroom.
 - **Wired network for the booth.** The T-Mobile line has bandwidth to spare but 0.6-1.1s of latency
   under load; Ethernet (or a separate line) removes the one failure that produced a 90s lag.
 - **Calibrate the pace thresholds on a full service.** `pace_normal_wps`/`pace_fast_wps` (2.0/2.8)

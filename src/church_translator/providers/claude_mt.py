@@ -20,6 +20,17 @@ from .base import MTProvider
 # scripture reference, numbers and names intact. This is what a human
 # simultaneous interpreter does, and it costs nothing at playback.
 #
+# The 2026-09-14 full service (README "What's next") showed why 77% still was
+# not enough: at that ratio the channel ran close enough to 100% busy that the
+# output buffer spent most of the service near audio.max_backlog_s rather than
+# catching up in the gaps between sentences — the 8% saved on 2026-09-11 was a
+# genuine win but was bought back by the sheer length of an unbroken service.
+# The line below pushes harder on the same lever with the same guardrail
+# (never drop meaning-bearing content): make the channel-budget framing
+# explicit to the model instead of leaving brevity as one adjective among
+# several, since that is the one instruction with a direct, compounding effect
+# on how far behind the whole service ends up.
+#
 # The "never addressed to you" part is not decoration. On the 2026-09-11 test,
 # once turns were cut into short clauses, three in a row came back as the model
 # talking to the booth in English — "I need context to interpret this
@@ -41,6 +52,14 @@ _SYSTEM_PROMPT = (
     "full meaning. Drop filler, false starts, and self-repetition. Never drop or "
     "soften: scripture references, numbers, names, commands, or the point being "
     "made. Preserve tone and register.\n"
+    "This is read aloud over a channel that runs close to fully booked for the "
+    "whole service — a longer rendering is not heard sooner, it is heard later "
+    "and pushes everything behind it later still. So between two phrasings that "
+    "carry the same meaning, always take the shorter one: skip connective "
+    "throat-clearing (\"so\", \"now\", \"well\") the English did not need, use "
+    "the plainer synonym over the fuller one, and never restate in {target_name} "
+    "a point the English already made once. This is about word count, not about "
+    "meaning — every fact, name, number and command still has to survive.\n"
     "Fragments often start or stop mid-sentence — interpret just that fragment, "
     "do not complete it or add context of your own. If it holds nothing to "
     "interpret (noise, a lone \"uh\"), output nothing.\n"
