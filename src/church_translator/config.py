@@ -185,6 +185,24 @@ class BotConfig:
 
 
 @dataclass
+class PricingConfig:
+    """Vendor prices for the cost report (costs.py). Checked 2026-09-13 against
+    each vendor's pricing page — when a bill disagrees, fix it here.
+
+    Cartesia is the one that depends on the plan: 1 credit per character. The
+    booth is on Pro ($5 for 100K credits) with overages on at $65 per 1M, and a
+    service outgrows the 100K pack (OPERATOR_GUIDE.md "Сколько это стоит"), so
+    the marginal $0.065 per 1K chars is what a service really adds. On Startup
+    ($49/1.25M) it would be $0.039.
+    """
+
+    stt_usd_per_hour: float = 0.15        # AssemblyAI Universal-Streaming, billed per hour the socket is open
+    mt_input_usd_per_mtok: float = 1.0    # Claude Haiku 4.5
+    mt_output_usd_per_mtok: float = 5.0
+    tts_usd_per_1k_chars: float = 0.065   # Cartesia Pro overage rate
+
+
+@dataclass
 class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     # What the speaker is expected to say — passed to STT as its candidate
@@ -199,6 +217,7 @@ class AppConfig:
     tts: TTSConfig = field(default_factory=TTSConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     bot: BotConfig = field(default_factory=BotConfig)
+    pricing: PricingConfig = field(default_factory=PricingConfig)
 
     def validate(self) -> None:
         if not self.languages:
@@ -238,10 +257,11 @@ def load_config(path: str | Path) -> AppConfig:
     tts = TTSConfig(**raw.get("tts", {}))
     logging_cfg = LoggingConfig(**raw.get("logging", {}))
     bot = BotConfig(**raw.get("bot", {}))
+    pricing = PricingConfig(**raw.get("pricing", {}))
 
     cfg = AppConfig(
         audio=audio, source_languages=source_languages, languages=languages,
-        pipeline=pipeline, stt=stt, tts=tts, logging=logging_cfg, bot=bot,
+        pipeline=pipeline, stt=stt, tts=tts, logging=logging_cfg, bot=bot, pricing=pricing,
     )
     cfg.validate()
     return cfg

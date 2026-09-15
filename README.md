@@ -149,6 +149,21 @@ time, the problem comes straight back.
 Every STT/MT/TTS call appends a row to `logs/usage.csv` (component, language, duration/characters,
 timestamp). Nothing to enable — the logging already lives inside `pipeline.py`.
 
+Dollars per session come out of the same file:
+
+```bash
+uv run church-translator cost               # last 5 sessions
+uv run church-translator cost --session svc-20260911-013809
+```
+
+Each vendor has its own meter, and the log carries all three: AssemblyAI bills the hours the
+socket is open (a `session` row written at ⏹), Claude bills tokens (exact counts from the API in
+the `mt` row's note, `in_tok=`/`out_tok=`), Cartesia bills characters (`tts` rows). The Telegram
+bot shows the running total in /status and the breakdown in its ⏹ report; `run` and `replay`
+print it on exit. Prices live in the `pricing:` config section (defaults in `PricingConfig`,
+checked 2026-09-13) — change them there when a plan or price changes. Rows logged before this
+existed have no tokens and no session row; those parts are estimated and marked `~`.
+
 ## Testing changes without a service (`replay`)
 
 All three output bugs — cutting off mid-word, losing the middle of a thought, and drift that grows

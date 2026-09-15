@@ -235,6 +235,10 @@ def _report_text(report: StopReport) -> str:
         lines.append(
             "Пропущено фраз из-за отставания: " + ", ".join(f"{code} {n}" for code, n in report.dropped.items())
         )
+    if report.mode == "real":
+        lines.append("")
+        lines.append("💵 Стоимость")
+        lines.extend(report.cost.lines())
     return "\n".join(lines)
 
 
@@ -665,6 +669,10 @@ class BoothBot:
                     lines.append(f"🎚 Сигнал с микшера {20 * math.log10(peak):.0f} dBFS")
                 if s.mode == "real":
                     lines.append(f"Озвучено {s.usage.tts_chars} симв., ошибок {s.usage.errors}")
+                    # Claude + Cartesia so far, plus the socket at its hourly rate.
+                    cost = s.usage.cost
+                    running = cost.mt_usd + cost.tts_usd + s.elapsed_s / 3600 * cost.pricing.stt_usd_per_hour
+                    lines.append(f"💵 Потрачено ≈ ${running:.2f}")
                 dropped = s.router.dropped_report()
                 if any(dropped.values()):
                     lines.append(f"Пропущено фраз из-за отставания: {sum(dropped.values())}")

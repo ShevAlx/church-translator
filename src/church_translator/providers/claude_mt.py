@@ -73,6 +73,7 @@ class ClaudeMT(MTProvider):
         self._model = model
 
     def translate(self, text: str, source_language: str, target_language: str) -> str:
+        self.last_usage = None
         if not text.strip():
             return ""
         target_name = _LANGUAGE_NAMES.get(target_language, target_language)
@@ -82,6 +83,8 @@ class ClaudeMT(MTProvider):
             system=_SYSTEM_PROMPT.format(target_name=target_name),
             messages=[{"role": "user", "content": f"<utterance>{text}</utterance>"}],
         )
+        # Billed even when the reply is dropped below, so recorded before that.
+        self.last_usage = (response.usage.input_tokens, response.usage.output_tokens)
         # Cyrillic costs 2-3x the tokens of the English it came from, so a long
         # utterance can hit the ceiling and come back neatly cut off mid-sentence
         # with no error anywhere. Loud on stdout beats a listener wondering why

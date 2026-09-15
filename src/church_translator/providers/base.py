@@ -54,6 +54,11 @@ class STTProvider(ABC):
 class MTProvider(ABC):
     """Text translation, source language auto-detected upstream by STT."""
 
+    # (input_tokens, output_tokens) of the last translate() call, for the cost
+    # report. None = this provider does not bill by the token (the mock).
+    # One instance per language thread, so no locking.
+    last_usage: tuple[int, int] | None = None
+
     @abstractmethod
     def translate(self, text: str, source_language: str, target_language: str) -> str: ...
 

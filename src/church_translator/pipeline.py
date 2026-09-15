@@ -309,9 +309,11 @@ class _LanguageStage(threading.Thread):
         try:
             t0 = time.monotonic()
             translated = self._mt.translate(text, source_language, self._lang.code)
+            usage = self._mt.last_usage
             self._usage_logger.log(
                 self._session_id, self._lang.code, "mt",
                 duration_s=time.monotonic() - t0, chars=len(translated),
+                note=f"in_tok={usage[0]} out_tok={usage[1]}" if usage else "",
             )
             if not translated.strip():
                 return

@@ -13,6 +13,7 @@ import sounddevice as sd
 
 from .audio_io import list_devices, resolve_device
 from .config import load_config, save_config
+from .costs import costs_from_csv
 from .pipeline import _write_debug_wav
 from .session import LiveSession, build_pipeline
 from .usage_log import UsageLogger
@@ -63,6 +64,8 @@ def _cmd_run(args: argparse.Namespace) -> None:
             # The operator's tuning signal: anything above the odd one or two
             # means max_backlog_s is too tight for how fast the voice speaks.
             print(f"[audio] whole turns skipped per language (lag > {config.audio.max_backlog_s:.0f}s): {report.dropped}")
+        if report.mode == "real":
+            print("\n".join(report.cost.lines()))
         print("Stopped.")
 
 
@@ -154,6 +157,7 @@ def _cmd_replay(args: argparse.Namespace) -> None:
             lang.voice_id = args.voice  # A/B a stock voice against the clone on identical input
         print(f"voice override: every language uses {args.voice}")
 
+    opened_at = time.monotonic()  # AssemblyAI bills from the handshake inside build_pipeline
     pipeline = build_pipeline(config, router, usage_logger, session_id)
 
     print(f"replaying {args.input} ({len(source) / config.audio.samplerate:.0f}s) at wall-clock pace, "
@@ -164,6 +168,8 @@ def _cmd_replay(args: argparse.Namespace) -> None:
     finally:
         pipeline.stop()
         router.stop()
+        usage_logger.log(session_id, "all", "session", duration_s=time.monotonic() - opened_at,
+                         note=f"mode={config.pipeline.mode}")
 
     src_s = len(source) / config.audio.samplerate
     print()
@@ -178,6 +184,28 @@ def _cmd_replay(args: argparse.Namespace) -> None:
     underruns = router.underrun_report()
     print(f"  underruns (silence in pauses is normal): {underruns}")
     print("\nListen to the files above — exactly what a listener would have heard.")
+    if config.pipeline.mode == "real":
+        cost = costs_from_csv(config.logging.usage_log_path, config.pricing).get(session_id)
+        if cost is not None:
+            print("\n" + "\n".join(cost.lines()))
+
+
+def _cmd_cost(args: argparse.Namespace) -> None:
+    """Dollars per session from usage.csv. Prices come from config's `pricing:`
+    section (defaults in config.PricingConfig) — edit those, not this."""
+    config = load_config(args.config)
+    costs = costs_from_csv(config.logging.usage_log_path, config.pricing)
+    if args.session:
+        picked = [c for sid, c in costs.items() if sid == args.session]
+        if not picked:
+            raise SystemExit(f"no session {args.session!r} in {config.logging.usage_log_path}")
+    else:
+        picked = [c for c in costs.values() if c.billable and (c.mt_calls or c.tts_chars)][-args.last:]
+    for cost in picked:
+        print(f"\n{cost.session_id}")
+        print("\n".join("  " + line for line in cost.lines()))
+    if len(picked) > 1:
+        print(f"\nВсего за {len(picked)} сессий: ${sum(c.total_usd for c in picked):.2f}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -202,6 +230,12 @@ def main(argv: list[str] | None = None) -> None:
     replay_parser.add_argument("--drain", type=float, default=45.0,
                                help="seconds to keep playing after the input ends, so the tail is not cut")
     replay_parser.set_defaults(func=_cmd_replay)
+
+    cost_parser = sub.add_parser("cost", help="what each session cost (AssemblyAI + Claude + Cartesia), from usage.csv")
+    cost_parser.add_argument("--config", default="config.yaml")
+    cost_parser.add_argument("--session", help="one session id, e.g. svc-20260911-013809")
+    cost_parser.add_argument("--last", type=int, default=5, help="how many recent sessions to show (default 5)")
+    cost_parser.set_defaults(func=_cmd_cost)
 
     sample_parser = sub.add_parser("record-sample", help="record a clean clip for voice cloning")
     sample_parser.add_argument("--config", required=True, help="path to config.yaml")

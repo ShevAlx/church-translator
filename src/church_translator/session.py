@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Callable
 
 from .audio_io import AudioRouter, resolve_device
-from .config import AppConfig
+from .config import AppConfig, PricingConfig
+from .costs import SessionCost
 from .pipeline import Pipeline
 from .providers.mock import MockMT, MockSTT, MockTTS
 from .usage_log import UsageLogger, date_folder
@@ -103,20 +104,29 @@ class SessionUsageLogger(UsageLogger):
     errors as they happen. The CSV stays the record; the counters are what a
     front end without a terminal (the bot) can show at ⏹."""
 
-    def __init__(self, path: str | Path, on_error: Callable[[str, str], None] | None = None):
+    def __init__(
+        self,
+        path: str | Path,
+        on_error: Callable[[str, str], None] | None = None,
+        pricing: PricingConfig | None = None,
+    ):
         super().__init__(path)
         self._on_error = on_error
         self._counts_lock = threading.Lock()
         self.tts_chars = 0
         self.tts_segments = 0
         self.errors = 0
+        self.cost = SessionCost("", pricing=pricing or PricingConfig())  # running total, same rules as `cost` CLI
 
     def log(self, session_id, language, component, duration_s=None, chars=None, note="") -> None:
         super().log(session_id, language, component, duration_s=duration_s, chars=chars, note=note)
         with self._counts_lock:
-            if component == "tts" and chars:
+            if component == "mt":
+                self.cost.add_mt(chars or 0, note)
+            elif component == "tts" and chars:
                 self.tts_chars += chars
                 self.tts_segments += 1
+                self.cost.tts_chars += chars
             elif component == "error":
                 self.errors += 1
         if component == "error" and self._on_error is not None:
@@ -134,6 +144,7 @@ class StopReport:
     tts_segments: int
     errors: int
     recordings_dir: Path | None
+    cost: SessionCost
 
 
 class LiveSession:
@@ -160,8 +171,12 @@ class LiveSession:
             catchup_start_s=config.audio.catchup_start_s,
             max_playback_rate=config.audio.max_playback_rate,
         )
-        self.usage = SessionUsageLogger(config.logging.usage_log_path, on_error=on_error)
+        self.usage = SessionUsageLogger(config.logging.usage_log_path, on_error=on_error, pricing=config.pricing)
         self.session_id = self.usage.new_session_id()  # shared with recordings, so filenames line up with usage.csv
+        self.usage.cost.session_id = self.session_id
+        self.usage.cost.billable = self.mode == "real"
+        # AssemblyAI's meter starts at the handshake inside build_pipeline, not at ▶️.
+        self._opened_at = time.monotonic()
         self.pipeline = build_pipeline(config, self.router, self.usage, self.session_id)
         self.recordings_dir: Path | None = None
         self.started_at: float | None = None
@@ -190,6 +205,12 @@ class LiveSession:
     def stop(self) -> StopReport:
         self.pipeline.stop()
         self.router.stop()
+        open_s = time.monotonic() - self._opened_at
+        # The one row the cost report needs that no stage writes: how long the
+        # billed STT socket was open.
+        self.usage.log(self.session_id, "all", "session", duration_s=open_s, note=f"mode={self.mode}")
+        if self.mode == "real":
+            self.usage.cost.stt_hours = open_s / 3600
         by_code = {lang.output_channel: lang.code for lang in self.config.languages}
         return StopReport(
             session_id=self.session_id,
@@ -201,6 +222,7 @@ class LiveSession:
             tts_segments=self.usage.tts_segments,
             errors=self.usage.errors,
             recordings_dir=self.recordings_dir,
+            cost=self.usage.cost,
         )
 
     # -- health, for whoever is watching (menu bar tick, bot watchdog) ---------
