@@ -25,6 +25,7 @@ import numpy as np
 from .audio_io import AudioRouter
 from .config import AppConfig, LanguageConfig, TTSConfig
 from .providers.base import MTProvider, STTProvider, TranscriptEvent, TTSProvider
+from .transcript_log import TranscriptLog
 from .usage_log import UsageLogger, date_folder
 
 
@@ -208,7 +209,11 @@ class _STTStage(threading.Thread):
 # ~8s the output buffer is close to skipping whole turns (audio.max_backlog_s).
 QUEUE_BOOST_START_S = 3.0
 QUEUE_BOOST_FULL_S = 8.0
-PACE_SMOOTHING = 0.3  # weight of the newest turn in the running pace estimate
+PACE_SMOOTHING = 0.3
+# The previous fragment goes to MT as context only while it is still part of
+# the same stretch of speech; after a pause this long it belongs to another
+# thought and would only mislead.
+CONTEXT_MAX_AGE_S = 20.0  # weight of the newest turn in the running pace estimate
 # Largest speed change from one segment to the next. A jump from 1.0 straight to
 # 1.3 between two clauses of one sentence was audible on the 2026-09-11 test;
 # 0.1 per segment still reaches the ceiling within three clauses.
@@ -256,6 +261,7 @@ class _LanguageStage(threading.Thread):
         stop_event: threading.Event,
         debug_audio_dir: str | None = None,
         tts_config: "TTSConfig | None" = None,
+        transcript: TranscriptLog | None = None,
     ):
         super().__init__(name=f"lang-{lang.code}", daemon=True)
         self._lang = lang
@@ -271,6 +277,9 @@ class _LanguageStage(threading.Thread):
         self._tts_config = tts_config  # None = natural speed, no pace tracking
         self._pace_wps: float | None = None  # preacher's pace, smoothed over turns
         self._last_speed: float | None = None  # previous segment's speed, for MAX_SPEED_STEP
+        self._transcript = transcript
+        self._prev_source: str | None = None  # last fragment, handed to MT as context
+        self._prev_source_at = 0.0
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -308,7 +317,10 @@ class _LanguageStage(threading.Thread):
         """
         try:
             t0 = time.monotonic()
-            translated = self._mt.translate(text, source_language, self._lang.code)
+            fresh = time.monotonic() - self._prev_source_at <= CONTEXT_MAX_AGE_S
+            context = self._prev_source if fresh else None
+            self._prev_source, self._prev_source_at = text, time.monotonic()
+            translated = self._mt.translate(text, source_language, self._lang.code, context=context)
             usage = self._mt.last_usage
             self._usage_logger.log(
                 self._session_id, self._lang.code, "mt",
@@ -316,7 +328,9 @@ class _LanguageStage(threading.Thread):
                 note=f"in_tok={usage[0]} out_tok={usage[1]}" if usage else "",
             )
             if not translated.strip():
+                self._log_text(turn_uid, self._mt.last_status or "empty", text)
                 return
+            self._log_text(turn_uid, "ok", text, translated)
 
             t0 = time.monotonic()
             first_audio_s: float | None = None
@@ -356,7 +370,13 @@ class _LanguageStage(threading.Thread):
             self._usage_logger.log(
                 self._session_id, self._lang.code, "error", note=str(exc)[:200],
             )
+            self._log_text(turn_uid, "error", text, str(exc)[:200])
             print(f"[{self._lang.code}] pipeline error, dropping this utterance: {exc}")
+
+
+    def _log_text(self, turn_uid: int, status: str, source: str, translation: str = "") -> None:
+        if self._transcript is not None:
+            self._transcript.log(self._lang.code, turn_uid, status, source, translation)
 
 
 class _PassthroughStage(threading.Thread):
@@ -391,6 +411,7 @@ class Pipeline:
         tts_by_language: dict[str, TTSProvider] | None = None,
         debug_audio_dir: str | None = None,
         session_id: str | None = None,
+        transcript: TranscriptLog | None = None,
     ):
         self._config = config
         self._router = router
@@ -419,7 +440,7 @@ class Pipeline:
             self._threads.append(
                 _LanguageStage(
                     lang, q, mt, tts, router, usage_logger, self._session_id, self._stop_event,
-                    debug_audio_dir=debug_audio_dir, tts_config=config.tts,
+                    debug_audio_dir=debug_audio_dir, tts_config=config.tts, transcript=transcript,
                 )
             )
 

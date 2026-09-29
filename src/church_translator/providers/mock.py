@@ -40,7 +40,9 @@ class MockSTT(STTProvider):
 
 
 class MockMT(MTProvider):
-    def translate(self, text: str, source_language: str, target_language: str) -> str:
+    def translate(
+        self, text: str, source_language: str, target_language: str, context: str | None = None
+    ) -> str:
         return text
 
 

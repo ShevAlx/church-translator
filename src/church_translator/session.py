@@ -21,6 +21,7 @@ from .config import AppConfig, PricingConfig
 from .costs import SessionCost
 from .pipeline import Pipeline
 from .providers.mock import MockMT, MockSTT, MockTTS
+from .transcript_log import TranscriptLog
 from .usage_log import UsageLogger, date_folder
 
 # No callback from PortAudio for this long means the interface is gone (USB
@@ -29,7 +30,10 @@ from .usage_log import UsageLogger, date_folder
 AUDIO_STALL_S = 3.0
 
 
-def build_pipeline(config: AppConfig, router: AudioRouter, usage_logger: UsageLogger, session_id: str) -> Pipeline:
+def build_pipeline(
+    config: AppConfig, router: AudioRouter, usage_logger: UsageLogger, session_id: str,
+    transcript: TranscriptLog | None = None,
+) -> Pipeline:
     mode = config.pipeline.mode
     if mode == "passthrough":
         return Pipeline(config, router, usage_logger, session_id=session_id)
@@ -42,7 +46,7 @@ def build_pipeline(config: AppConfig, router: AudioRouter, usage_logger: UsageLo
         }
         return Pipeline(
             config, router, usage_logger, stt=stt, mt_by_language=mt_by_lang, tts_by_language=tts_by_lang,
-            debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id,
+            debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id, transcript=transcript,
         )
     if mode != "real":
         raise ValueError(f"unknown pipeline.mode: {mode!r}")
@@ -92,7 +96,7 @@ def build_pipeline(config: AppConfig, router: AudioRouter, usage_logger: UsageLo
         }
         return Pipeline(
             config, router, usage_logger, stt=stt, mt_by_language=mt_by_lang, tts_by_language=tts_by_lang,
-            debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id,
+            debug_audio_dir=config.logging.debug_audio_dir, session_id=session_id, transcript=transcript,
         )
     except Exception:
         stt.close()
@@ -177,7 +181,8 @@ class LiveSession:
         self.usage.cost.billable = self.mode == "real"
         # AssemblyAI's meter starts at the handshake inside build_pipeline, not at ▶️.
         self._opened_at = time.monotonic()
-        self.pipeline = build_pipeline(config, self.router, self.usage, self.session_id)
+        self.transcript = TranscriptLog()
+        self.pipeline = build_pipeline(config, self.router, self.usage, self.session_id, self.transcript)
         self.recordings_dir: Path | None = None
         self.started_at: float | None = None
 
@@ -194,24 +199,37 @@ class LiveSession:
                 # the delay can only be estimated by ear, and the service cannot be
                 # replayed offline afterwards.
                 self.router.start_input_recording(self.recordings_dir / f"{self.session_id}-source.wav")
+                # The words, next to the audio: what was recognized, what each
+                # channel said, and what got lost where (transcript_log.py).
+                self.transcript.open(self.recordings_dir / f"{self.session_id}-transcript.tsv")
             self.router.start()
             self.pipeline.start()
         except Exception:
             self.pipeline.stop()  # closes the billed STT socket
             self.router.stop()
+            self.transcript.close()
             raise
         self.started_at = time.monotonic()
 
     def stop(self) -> StopReport:
         self.pipeline.stop()
         self.router.stop()
+        by_code = {lang.output_channel: lang.code for lang in self.config.languages}
+        for ch, uids in self.router.dropped_turns().items():
+            if not uids:
+                continue
+            texts = self.transcript.log_dropped(by_code[ch], uids)
+            print(f"[audio] {by_code[ch]}: {len(uids)} turn(s) skipped for lag "
+                  f"(> {self.config.audio.max_backlog_s:.0f}s behind):")
+            for text in texts:
+                print(f"[audio]   - {text[:160]!r}")
+        self.transcript.close()
         open_s = time.monotonic() - self._opened_at
         # The one row the cost report needs that no stage writes: how long the
         # billed STT socket was open.
         self.usage.log(self.session_id, "all", "session", duration_s=open_s, note=f"mode={self.mode}")
         if self.mode == "real":
             self.usage.cost.stt_hours = open_s / 3600
-        by_code = {lang.output_channel: lang.code for lang in self.config.languages}
         return StopReport(
             session_id=self.session_id,
             mode=self.mode,

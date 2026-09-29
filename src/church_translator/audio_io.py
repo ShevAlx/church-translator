@@ -168,6 +168,9 @@ class AudioRouter:
         self._stream: sd.Stream | None = None
         self._underrun_count = {ch: 0 for ch in output_channels}
         self._dropped_count = {ch: 0 for ch in output_channels}
+        # Which turns were skipped, so ⏹ can say *what* was lost, not only how
+        # much. A list append is safe on the real-time thread.
+        self._dropped_uids: dict[int, list[int]] = {ch: [] for ch in output_channels}
         self._next_utterance_id = 0
         self._id_lock = threading.Lock()
         # The utterance each channel is in the middle of playing. The backlog cap
@@ -334,6 +337,7 @@ class AudioRouter:
                     while buf and buf[0][0] == uid:
                         buf.popleft()
                     self._dropped_count[ch] += 1
+                    self._dropped_uids[ch].append(uid)
                     continue  # skip this whole thought, try the next one
                 self._playing_uid[ch] = uid
             take = min(len(chunk), need - filled)
@@ -386,6 +390,10 @@ class AudioRouter:
     def dropped_report(self) -> dict[int, int]:
         """Whole turns skipped per channel to stay current (see _take)."""
         return dict(self._dropped_count)
+
+    def dropped_turns(self) -> dict[int, list[int]]:
+        """Utterance ids behind dropped_report(), per channel."""
+        return {ch: list(uids) for ch, uids in self._dropped_uids.items()}
 
     def catchup_report(self) -> float:
         """Seconds of output that were played compressed to claw back lag."""

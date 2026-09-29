@@ -42,27 +42,58 @@ _SYSTEM_PROMPT = (
     "soften: scripture references, numbers, names, commands, or the point being "
     "made. Preserve tone and register.\n"
     "Fragments often start or stop mid-sentence — interpret just that fragment, "
-    "do not complete it or add context of your own. If it holds nothing to "
-    "interpret (noise, a lone \"uh\"), output nothing.\n"
+    "do not complete it or add context of your own. A fragment may be only the "
+    "last word or two of a sentence (\"you.\", \"doing.\"): that is still speech — "
+    "render it as the ending of the sentence it finishes.\n"
+    "When a <previous> fragment is given, it has already been interpreted and "
+    "spoken. Use it only to understand what the utterance continues; never "
+    "repeat or translate it.\n"
+    "If the utterance holds nothing to interpret (noise, a lone \"uh\"), reply "
+    "with an empty message — no explanation.\n"
     "Output only the {target_name} interpretation — no notes, no quotes, no "
     "alternatives, no tags."
 )
 
 _LANGUAGE_NAMES = {"ru": "Russian", "uk": "Ukrainian", "en": "English", "es": "Spanish"}
 
-# Target languages written in Cyrillic, where an answer that is mostly Latin
-# letters cannot be a translation — it is the model answering in English.
+# Target languages written in Cyrillic, where an answer with next to no
+# Cyrillic in it cannot be a translation — it is the model answering in English.
 _CYRILLIC_TARGETS = {"ru", "uk", "be", "bg", "sr", "kk"}
+# Below this share of Cyrillic letters a reply is suspect. Not "over half
+# Latin": that threw away "Я собирался на Fashion Island." on 2026-09-27 —
+# a real sentence, lost in both channels, because the place name is longer
+# than the Russian around it. Assistant chatter has no Cyrillic at all.
+_MIN_CYRILLIC_SHARE = 0.25
 
 
-def _mostly_latin(text: str) -> bool:
-    """True when over half the letters are a-z: the model replied in English.
-    A brand or name inside a Russian sentence ("Starbucks") stays well under."""
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
+def _is_cyrillic(c: str) -> bool:
+    return "\u0400" <= c <= "\u04ff"
+
+
+def _not_a_translation(source: str, out: str) -> bool:
+    """True when `out` is the model talking in English, not an interpretation.
+
+    Mostly-Latin output is still kept when every Latin word in it comes from
+    the source: a fragment that is only a name ("Fashion Island.") legitimately
+    comes back unchanged. Chatter ("Output: (nothing - this fragment ...") has
+    words the preacher never said.
+    """
+    letters = [c for c in out if c.isalpha()]
+    if not letters or sum(map(_is_cyrillic, letters)) / len(letters) >= _MIN_CYRILLIC_SHARE:
         return False
-    latin = sum("a" <= c.lower() <= "z" for c in letters)
-    return latin / len(letters) > 0.5
+    source_words = {w.lower() for w in _latin_words(source)}
+    return any(w.lower() not in source_words for w in _latin_words(out))
+
+
+def _latin_words(text: str) -> list[str]:
+    word, words = [], []
+    for c in text + " ":
+        if c.isalpha() and not _is_cyrillic(c):
+            word.append(c)
+        elif word:
+            words.append("".join(word))
+            word = []
+    return words
 
 
 class ClaudeMT(MTProvider):
@@ -72,16 +103,27 @@ class ClaudeMT(MTProvider):
         self._client = anthropic.Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
         self._model = model
 
-    def translate(self, text: str, source_language: str, target_language: str) -> str:
+    def translate(
+        self, text: str, source_language: str, target_language: str, context: str | None = None
+    ) -> str:
         self.last_usage = None
+        self.last_status = None
         if not text.strip():
+            self.last_status = "empty"
             return ""
         target_name = _LANGUAGE_NAMES.get(target_language, target_language)
+        # The previous fragment rides along because ForceEndpoint cuts where the
+        # preacher pauses, not where the sentence ends: on 2026-09-27 "you." and
+        # "doing." arrived alone, the model answered them in English ("nothing
+        # to interpret"), and the end of each sentence was lost.
+        content = f"<utterance>{text}</utterance>"
+        if context and context.strip():
+            content = f"<previous>{context.strip()}</previous>\n{content}"
         response = self._client.messages.create(
             model=self._model,
             max_tokens=2048,
             system=_SYSTEM_PROMPT.format(target_name=target_name),
-            messages=[{"role": "user", "content": f"<utterance>{text}</utterance>"}],
+            messages=[{"role": "user", "content": content}],
         )
         # Billed even when the reply is dropped below, so recorded before that.
         self.last_usage = (response.usage.input_tokens, response.usage.output_tokens)
@@ -98,9 +140,12 @@ class ClaudeMT(MTProvider):
         out = out.removeprefix("<utterance>").removesuffix("</utterance>").strip()
         # Last line of defence: silence beats the cloned voice reading an
         # assistant's English reply into the headphones.
-        if target_language in _CYRILLIC_TARGETS and _mostly_latin(out):
+        if target_language in _CYRILLIC_TARGETS and _not_a_translation(text, out):
             print(f"[mt] dropped a non-{target_name} reply for {text!r}: {out[:80]!r}")
+            self.last_status = "filtered"
             return ""
+        if not out:
+            self.last_status = "empty"
         return _keep_open_if_unfinished(text, out)
 
 

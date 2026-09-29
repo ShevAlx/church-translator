@@ -59,8 +59,17 @@ class MTProvider(ABC):
     # One instance per language thread, so no locking.
     last_usage: tuple[int, int] | None = None
 
+    # Why the last translate() came back empty: "empty" (nothing to interpret)
+    # or "filtered" (a reply that was not a translation, thrown away). None
+    # when it did not. For the transcript log.
+    last_status: str | None = None
+
     @abstractmethod
-    def translate(self, text: str, source_language: str, target_language: str) -> str: ...
+    def translate(
+        self, text: str, source_language: str, target_language: str, context: str | None = None
+    ) -> str:
+        """`context`: the fragment spoken just before this one, if any. Only
+        for understanding — it has already been interpreted."""
 
 
 class TTSProvider(ABC):
